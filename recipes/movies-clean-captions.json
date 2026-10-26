@@ -1,0 +1,82 @@
+{
+  "schema_version": 1,
+  "recipe_name": "movies-clean-captions",
+  "description": "Route standalone MOVIE releases in Copy mode with automatic filename caption cleanup, stripped links/@usernames/promo text, and custom archive header.",
+  "placeholder_instructions": "Replace '-1001000000001' with your source release channel ID and '-1002000000101' with your curated Movies archive channel ID.",
+  "rules": [
+    {
+      "id": "recipe-movies-clean-01",
+      "name": "Curated Movies — Clean Caption Copy",
+      "description": "Matches standalone Movie files (.mkv/.mp4), strips promotional clutter, usernames, and trailing promo text after extension.",
+      "enabled": true,
+      "source_peer_id": "-1001000000001",
+      "destination_peer_ids": ["-1002000000101"],
+      "priority": 80,
+      "secondary_order": 1,
+      "exclusive_stop": true,
+      "delivery_mode": "COPY",
+      "delay_seconds": 2,
+      "max_retries": 4,
+      "sync_edits": true,
+      "sync_deletes": true,
+      "deduplication_override": "PER_DESTINATION",
+      "schedule": {
+        "enabled": false,
+        "start_time": "00:00",
+        "end_time": "23:59",
+        "days": [0, 1, 2, 3, 4, 5, 6],
+        "timezone": "UTC",
+        "behavior": "DEFER_UNTIL_WINDOW"
+      },
+      "filters": {
+        "message_type_filter": "MEDIA_ONLY",
+        "album_policy": "PROCESS_ITEMS",
+        "sender_filter_mode": "ANY",
+        "sender_user_ids": [],
+        "missing_sender_policy": "ALLOW_IN_CHANNELS",
+        "required_keywords": [],
+        "required_keywords_match_mode": "ANY",
+        "excluded_keywords": ["sample", "trailer", "camrip"],
+        "regex_pattern": "",
+        "regex_exclude_pattern": "",
+        "keyword_search_target": "TEXT_CAPTION_AND_FILENAME",
+        "case_sensitive": false,
+        "whole_word": true,
+        "min_file_size_mb": 300,
+        "max_file_size_mb": null,
+        "filename_contains": "",
+        "filename_ends_with": "",
+        "filename_regex": "",
+        "accepted_extensions": [".mkv", ".mp4"],
+        "excluded_extensions": [".exe", ".scr", ".txt"],
+        "missing_file_metadata_policy": "FAIL_FILTER"
+      },
+      "categories": {
+        "enabled": true,
+        "selected": ["MOVIE"],
+        "match_mode": "ALL"
+      },
+      "caption_transform": {
+        "clean_filename_mode": true,
+        "remove_links": true,
+        "remove_usernames": true,
+        "remove_hashtags": true,
+        "remove_emojis": true,
+        "remove_decorative_symbols": true,
+        "strip_text_after_extension": true,
+        "preserve_multipart_suffix": true,
+        "custom_header": "[Vault Cinema Archive]",
+        "custom_footer": "Verified Remux / BluRay Index",
+        "replacements": [
+          {
+            "step_order": 1,
+            "find_pattern": "\\[.*?\\]",
+            "replace_with": "",
+            "is_regex": true,
+            "case_sensitive": false
+          }
+        ]
+      }
+    }
+  ]
+}

@@ -1,0 +1,6 @@
+{
+  "name": "TeleRoute MTProto Core",
+  "description": "Self-hosted Telegram personal-account message routing, media classification, caption transformation, and historical backfill platform.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

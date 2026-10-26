@@ -1,0 +1,74 @@
+{
+  "schema_version": 1,
+  "recipe_name": "simple-mirror",
+  "description": "Mirror all eligible messages from one source chat to a backup destination chat preserving native forward attribution.",
+  "placeholder_instructions": "Replace '-1001000000001' with your source channel/group peer ID and '-1002000000001' with your destination channel/group peer ID.",
+  "rules": [
+    {
+      "id": "recipe-simple-mirror-01",
+      "name": "Simple 1:1 Chat Mirror",
+      "description": "Forwards every supported message from source chat to destination chat with duplicate protection.",
+      "enabled": true,
+      "source_peer_id": "-1001000000001",
+      "destination_peer_ids": ["-1002000000001"],
+      "priority": 50,
+      "secondary_order": 1,
+      "exclusive_stop": false,
+      "delivery_mode": "FORWARD",
+      "delay_seconds": 0,
+      "max_retries": 3,
+      "sync_edits": false,
+      "sync_deletes": true,
+      "deduplication_override": "GLOBAL",
+      "schedule": {
+        "enabled": false,
+        "start_time": "00:00",
+        "end_time": "23:59",
+        "days": [0, 1, 2, 3, 4, 5, 6],
+        "timezone": "UTC",
+        "behavior": "DEFER_UNTIL_WINDOW"
+      },
+      "filters": {
+        "message_type_filter": "ALL",
+        "album_policy": "PROCESS_ITEMS",
+        "sender_filter_mode": "ANY",
+        "sender_user_ids": [],
+        "missing_sender_policy": "ALLOW_IN_CHANNELS",
+        "required_keywords": [],
+        "required_keywords_match_mode": "ANY",
+        "excluded_keywords": [],
+        "regex_pattern": "",
+        "regex_exclude_pattern": "",
+        "keyword_search_target": "TEXT_AND_CAPTION",
+        "case_sensitive": false,
+        "whole_word": false,
+        "min_file_size_mb": null,
+        "max_file_size_mb": null,
+        "filename_contains": "",
+        "filename_ends_with": "",
+        "filename_regex": "",
+        "accepted_extensions": [],
+        "excluded_extensions": [],
+        "missing_file_metadata_policy": "PASS_IF_NON_FILE"
+      },
+      "categories": {
+        "enabled": false,
+        "selected": [],
+        "match_mode": "ANY"
+      },
+      "caption_transform": {
+        "clean_filename_mode": false,
+        "remove_links": false,
+        "remove_usernames": false,
+        "remove_hashtags": false,
+        "remove_emojis": false,
+        "remove_decorative_symbols": false,
+        "strip_text_after_extension": false,
+        "preserve_multipart_suffix": true,
+        "custom_header": "",
+        "custom_footer": "",
+        "replacements": []
+      }
+    }
+  ]
+}

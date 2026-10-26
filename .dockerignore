@@ -1,0 +1,11 @@
+node_modules
+dist
+target
+data
+*.db
+*.db-shm
+*.db-wal
+.env
+.git
+.gitignore
+.aistudio

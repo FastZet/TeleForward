@@ -1,0 +1,92 @@
+services:
+  teleroute:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: teleroute-mtproto-core:latest
+    container_name: teleroute
+    restart: unless-stopped
+    user: "10001:10001"
+    read_only: true
+    tmpfs:
+      - /tmp:size=32M,mode=1770
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    ports:
+      - "${BIND_ADDRESS:-127.0.0.1}:${PORT:-3000}:3000"
+    environment:
+      - PORT=3000
+      - HOST=0.0.0.0
+      - DATABASE_URL=${DATABASE_URL:-sqlite:///data/teleroute.db?mode=rwc}
+      - SQLITE_PATH=${SQLITE_PATH:-/data/teleroute.db}
+      - SESSION_ENCRYPTION_KEY=${SESSION_ENCRYPTION_KEY:?Set a 32-byte hex SESSION_ENCRYPTION_KEY in .env}
+      - ADMIN_SESSION_SECRET=${ADMIN_SESSION_SECRET:?Set a 32-byte hex ADMIN_SESSION_SECRET in .env}
+      - TELEGRAM_API_ID=${TELEGRAM_API_ID:-}
+      - TELEGRAM_API_HASH=${TELEGRAM_API_HASH:-}
+      - MAX_QUEUE_DEPTH=${MAX_QUEUE_DEPTH:-2000}
+      - DELIVERY_CONCURRENCY=${DELIVERY_CONCURRENCY:-2}
+      - BACKFILL_BATCH_SIZE=${BACKFILL_BATCH_SIZE:-100}
+      - GLOBAL_SEND_DELAY_MS=${GLOBAL_SEND_DELAY_MS:-500}
+      - MIN_SEND_INTERVAL_MS=${MIN_SEND_INTERVAL_MS:-1000}
+      - COOKIE_SECURE=${COOKIE_SECURE:-false}
+      - RUST_LOG=${RUST_LOG:-info,teleroute=info}
+    volumes:
+      - teleroute_data:/data
+    stop_grace_period: 25s
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:3000/api/v1/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+
+  # Optional PostgreSQL profile: docker compose --profile postgres up -d
+  postgres:
+    image: postgres:16-alpine
+    container_name: teleroute-postgres
+    profiles: ["postgres"]
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-teleroute}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme_in_env}
+      POSTGRES_DB: ${POSTGRES_DB:-teleroute}
+    volumes:
+      - teleroute_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-teleroute}"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  # Optional Caddy automatic HTTPS reverse proxy profile: docker compose --profile https up -d
+  caddy:
+    image: caddy:2-alpine
+    container_name: teleroute-proxy
+    profiles: ["https"]
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      teleroute:
+        condition: service_healthy
+
+volumes:
+  teleroute_data:
+    driver: local
+  teleroute_pgdata:
+    driver: local
+  caddy_data:
+    driver: local
+  caddy_config:
+    driver: local

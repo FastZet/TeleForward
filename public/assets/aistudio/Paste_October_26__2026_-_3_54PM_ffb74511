@@ -1,0 +1,1241 @@
+# Project Specification: Self-Hosted Telegram Automation and Intelligent Message Routing Platform
+
+## 1. Your Role
+
+Act as a senior software architect, Rust systems programmer, Telegram MTProto specialist, full-stack web developer, database engineer, DevOps engineer, and security engineer.
+
+Design and implement a complete, production-oriented, self-hosted Telegram message automation platform. The application must run inside Docker on an ordinary Linux VPS and be manageable entirely through a modern web browser.
+
+The product must combine a sophisticated Telegram message-forwarding engine, configurable routing rules, media classification, content filtering, caption transformations, historical message processing, synchronization, and operational monitoring.
+
+This must be a functional application, not a UI prototype, static dashboard, or collection of mock API endpoints.
+
+All buttons, forms, tables, filters, background jobs, authentication flows, and configuration controls must be connected to real application logic. Do not fabricate successful operations when the backend has not performed them.
+
+## 2. Primary Objectives
+
+Build an application that satisfies these priorities, in order:
+
+1. Correct Telegram personal-account authentication and message processing.
+2. Complete rule-based message routing and filtering.
+3. Reliable historical backfill, missed-message recovery, and duplicate prevention.
+4. Low memory consumption and efficient CPU usage on small VPS instances.
+5. Persistent storage, restart recovery, and safe background processing.
+6. A polished, responsive web interface.
+7. Simple deployment, upgrades, backups, and maintenance through Docker Compose.
+8. Strong security for Telegram credentials, session data, and the administrative interface.
+
+The application must support multiple independent forwarding rules and destinations while operating continuously without requiring a browser tab to remain open.
+
+## 3. Mandatory Technology Stack
+
+Use Rust for the backend and message-processing engine wherever technically feasible.
+
+### Backend
+
+Preferred components:
+
+- **Rust:** Core application and processing engine.
+- **Axum:** HTTP server, REST API, and WebSocket or server-sent event endpoints where useful.
+- **Tokio:** Asynchronous runtime.
+- **SQLx:** Database access, migrations, transactions, and compile-time checked queries where practical.
+- **SQLite:** Default embedded database for a single-instance deployment, using WAL mode and appropriate busy-timeout and durability settings.
+- **PostgreSQL:** Optional deployment profile for larger installations or multiple application replicas.
+- **Serde:** Configuration and JSON serialization.
+- **Tracing:** Structured application logs and diagnostics.
+- **Tower:** HTTP middleware, request limits, and security controls.
+
+Select maintained, compatible library versions and pin dependencies in the project. Verify the actual capabilities and limitations of every important dependency before committing to an architecture.
+
+### Telegram integration
+
+Use the Telegram MTProto client API because the application must authenticate as a personal Telegram user and access chats available to that account.
+
+Investigate maintained Rust MTProto libraries, including `grammers`, and verify that the selected implementation supports the required authentication, dialogs, message history, media, sending, edit/delete updates, and reconnection behavior.
+
+Do not substitute a bot-only integration and claim it provides equivalent personal-account functionality.
+
+If a required Telegram operation cannot be implemented reliably with the available Rust libraries, isolate it behind a well-defined adapter interface. Evaluate a minimal separate integration service only when necessary. The routing engine, database, scheduler, rule evaluation, and web API must remain Rust-based.
+
+Document all unsupported Telegram operations honestly. Never silently replace a required feature with a placeholder.
+
+### Frontend
+
+Use:
+
+- React.
+- TypeScript.
+- Vite.
+- Tailwind CSS.
+- A maintained, accessible component library such as shadcn/ui.
+- TanStack Query for server state.
+- React Hook Form and Zod for forms and validation.
+
+The frontend must be a separate build artifact served by the application or a lightweight reverse proxy. Do not require Node.js to remain running in production if the frontend can be served as static files.
+
+Avoid unnecessary frontend libraries, oversized bundles, and excessive polling.
+
+### Deployment
+
+Use:
+
+- Multi-stage Docker builds.
+- Docker Compose.
+- A non-root container user.
+- A persistent mounted data directory.
+- Health checks.
+- Graceful shutdown.
+- Environment-variable configuration.
+- Optional reverse-proxy integration for HTTPS.
+
+Provide a working `Dockerfile`, `compose.yaml`, `.env.example`, database migrations, and complete setup documentation.
+
+The default deployment must work on an ordinary x86-64 Linux VPS. Keep ARM64 compatibility in mind.
+
+## 4. Product Architecture
+
+Implement the application as a modular monolith by default. Do not introduce microservices, message brokers, Redis, or additional infrastructure unless there is a demonstrated technical requirement.
+
+Organize the Rust backend into modules resembling the following:
+
+- `api`: HTTP routes, authentication, validation, and API errors.
+- `telegram`: MTProto session, authentication, dialogs, history, sending, and update handling.
+- `rules`: Rule models, validation, priority ordering, and evaluation.
+- `filters`: Message-type, sender, text, regex, file, and schedule filters.
+- `classifier`: Movie, television, combined-pack, and split-file detection.
+- `transform`: Caption cleanup and configurable replacements.
+- `router`: Source-to-destination dispatch.
+- `queue`: Durable delivery jobs, pacing, retries, and concurrency limits.
+- `backfill`: Historical message scanning and resumable jobs.
+- `catchup`: Recovery of messages missed during downtime.
+- `sync`: Source edits and deletions propagated to destination copies.
+- `storage`: Database models, migrations, transactions, and repositories.
+- `scheduler`: Time-window evaluation and periodic maintenance.
+- `observability`: Logs, statistics, health, and diagnostics.
+- `security`: Session protection, access control, and secrets management.
+
+Use explicit interfaces between these modules so that the Telegram client implementation can be replaced without rewriting the routing engine.
+
+## 5. Telegram Account Authentication
+
+Implement a complete personal-account authentication flow.
+
+### Required functionality
+
+1. Configure the Telegram API ID and API hash.
+2. Enter a phone number in international format.
+3. Request a Telegram login code.
+4. Enter and verify the code.
+5. Support two-step verification passwords.
+6. Handle any additional authentication challenge supported by the selected Telegram library.
+7. Persist the authenticated session securely.
+8. Reconnect after application restarts.
+9. Detect invalid, revoked, or expired sessions.
+10. Provide a logout operation that disconnects the session.
+11. Display connection status, authentication errors, and reconnection status.
+12. Prevent simultaneous login flows from corrupting the session.
+
+Do not store plaintext passwords, login codes, API hashes, or session strings in ordinary application logs.
+
+The Telegram session must be persisted so the user does not need to authenticate after every restart. Protect session material using a documented encryption approach, with the encryption key supplied separately from the database.
+
+Do not expose session material through the browser, general-purpose API responses, exports, or frontend logs.
+
+### Connection states
+
+Represent authentication and connection states explicitly, for example:
+
+- Not configured.
+- Awaiting phone number.
+- Awaiting login code.
+- Awaiting two-step password.
+- Connecting.
+- Connected.
+- Reconnecting.
+- Authentication expired.
+- Disconnected.
+- Error.
+
+The interface must accurately reflect the backend state.
+
+## 6. Main Dashboard
+
+Build a responsive dashboard with a clean, professional design suitable for desktop and mobile browsers.
+
+Display:
+
+- Telegram connection status.
+- Global forwarding switch.
+- Forwarding worker status.
+- Number of enabled and disabled rules.
+- Number of configured sources and destinations.
+- Successful deliveries.
+- Skipped messages.
+- Failed deliveries.
+- Pending queue jobs.
+- Active backfill or catch-up jobs.
+- Recent forwarding activity.
+- Recent errors.
+- Missed-message recovery status.
+
+Provide navigation to:
+
+1. Dashboard.
+2. Rules.
+3. Chats.
+4. Backfill.
+5. Delivery queue.
+6. Logs.
+7. Statistics.
+8. Settings.
+9. About and diagnostics.
+
+Statistics should be derived from persistent application data, not hardcoded examples.
+
+## 7. Chat and Destination Management
+
+The user must be able to inspect chats accessible to the authenticated Telegram account.
+
+Support the following source and destination types where the Telegram API permits them:
+
+- Channels.
+- Groups.
+- Supergroups.
+- Private chats.
+
+Provide a chat selector with:
+
+- Search by title or username.
+- Chat type.
+- Username where available.
+- Telegram peer identifier.
+- Selection of one or multiple destinations.
+- A way to refresh the available chat list.
+- Clear indication of inaccessible or invalid chat identifiers.
+
+Do not assume that every Telegram chat is readable or writable. Report permission errors and missing access clearly.
+
+Use stable Telegram peer identifiers internally. Do not rely on mutable chat titles as primary keys.
+
+## 8. Rule Management
+
+This is the application's core feature.
+
+Users must be able to create, inspect, edit, duplicate, enable, disable, reorder, and delete forwarding rules.
+
+Each rule must support:
+
+- Unique identifier.
+- User-defined name.
+- Description, if useful.
+- Enabled/disabled status.
+- One source chat.
+- One or more destination chats.
+- Priority from 0 to 100.
+- Exclusive-stop behavior.
+- Message-type filter.
+- Sender filter.
+- Required keywords.
+- Excluded keywords.
+- Regular-expression filters.
+- Case sensitivity.
+- Whole-word matching.
+- Minimum and maximum file size.
+- Filename substring matching.
+- Filename suffix matching.
+- Filename regular expression.
+- Automatic content categories.
+- ALL-versus-ANY category matching.
+- Schedule.
+- Forward or copy mode.
+- Caption transformation settings.
+- Per-rule delay.
+- Retry configuration.
+- Edit/delete synchronization options.
+
+Create an intuitive rule editor divided into logical sections or tabs:
+
+1. General.
+2. Source and destinations.
+3. Message and sender filters.
+4. Keywords and regular expressions.
+5. File filters.
+6. Media categories.
+7. Scheduling.
+8. Delivery settings.
+9. Caption transformations.
+10. Advanced options.
+
+Show validation errors inline and preserve unsaved form state when appropriate.
+
+### Rule priority
+
+Evaluate rules in descending priority order, with a deterministic secondary ordering for equal priorities.
+
+When Exclusive stop is enabled, stop evaluating lower-priority rules only after the current rule has passed all its filters and is considered a match.
+
+Make the exact meaning of a match explicit and consistent. A rule that does not match must never block lower-priority rules.
+
+If multiple matching rules target the same destination, use the configured duplicate policy.
+
+### Rule testing
+
+Provide a Test Rule feature that evaluates the rule against a selected historical message or a representative message supplied by the user.
+
+Display:
+
+- Whether the rule matched.
+- Which conditions passed.
+- Which conditions failed.
+- Which category was assigned.
+- Which destinations would receive the message.
+- Whether exclusive-stop logic would apply.
+- Any transformations that would be applied.
+
+Testing must never send a message unless the user explicitly chooses a separate, clearly labeled live-delivery test action.
+
+## 9. Message-Type Filtering
+
+Implement the following message-type options:
+
+- All supported types.
+- Text only.
+- Media only.
+- Photos.
+- Videos.
+- Documents and files.
+- Audio.
+- Voice messages.
+
+Represent Telegram message types internally using a clear typed model rather than string comparisons scattered throughout the code.
+
+Define how messages with multiple media attributes, captions, albums, and unsupported types are handled.
+
+Do not claim support for a media type that the selected Telegram library cannot process.
+
+## 10. Sender Filtering
+
+Support:
+
+- Any sender.
+- Specific user IDs.
+- Administrators.
+- Anonymous administrators.
+- Verified users, where Telegram exposes the necessary information.
+
+Specific-user matching must use numeric Telegram identifiers, not usernames alone.
+
+Account for differences between channels, groups, supergroups, and private chats. If sender information is absent or cannot be verified, make the behavior explicit and configurable where appropriate.
+
+Never classify an unidentified sender as an administrator merely because the sender's display name resembles a channel name.
+
+## 11. Keyword and Regular-Expression Filters
+
+Support the following controls:
+
+- Only-if-contains terms.
+- Skip-if-contains terms.
+- Comma-separated alternatives.
+- Regular-expression mode.
+- Case-sensitive matching.
+- Whole-word matching.
+
+Define the matching rules precisely.
+
+For multiple required terms, provide a documented choice between ANY and ALL matching if necessary. Keep the default predictable and consistent with the rule editor.
+
+Use a safe Rust regex implementation. Avoid arbitrary backtracking regex engines where possible. Apply input-length limits, message-length limits, and execution safeguards.
+
+Handle malformed regular expressions through validation errors. A malformed regex must not silently match everything or disable filtering.
+
+Specify whether filters inspect message text, caption text, filename, or a combined searchable string. Do not combine these fields invisibly.
+
+## 12. File and Media Filters
+
+Support:
+
+- Minimum file size in MB.
+- Maximum file size in MB.
+- Filename contains.
+- Filename ends with.
+- Filename regular expression.
+- Multiple accepted extensions.
+- Multiple excluded extensions if useful.
+
+Use bytes internally for file sizes and clearly convert user-entered MB values.
+
+For example, a rule could require:
+
+- Video or document messages.
+- A filename containing `2160p`.
+- A `.mkv` extension.
+- A minimum size of 500 MB.
+- No filename containing `sample`.
+
+All populated file-filter conditions must be combined using logical AND unless a specific filter offers its own ANY/ALL mode.
+
+If a message does not expose a file size or filename, apply a documented missing-metadata policy. Never treat missing data as proof that the condition passed.
+
+## 13. Automatic Media Classification
+
+Implement a configurable, deterministic classifier that identifies four categories:
+
+- `MOVIE`
+- `TV_SHOW`
+- `COMBINED`
+- `SPLIT`
+
+Use caption text and filename as the primary inputs.
+
+### Movie detection
+
+Look for standalone movie naming patterns, release years, and movie-release naming conventions.
+
+Example:
+
+`Inception.2010.1080p.BluRay.x264.mkv`
+
+### Television detection
+
+Recognize episode markers such as:
+
+- `S01E05`
+- `S1E5`
+- `1x05`
+- Season/Episode labels.
+- Other common episodic naming conventions.
+
+### Combined-pack detection
+
+Recognize:
+
+- Complete seasons.
+- Season packs.
+- Episode ranges.
+- Multiple episode markers.
+- Explicit multi-episode release labels.
+
+### Split-file detection
+
+Recognize:
+
+- `.mkv.001`
+- `.7z.002`
+- `.rar` multipart archives.
+- `part1`, `part2`, and similar suffixes.
+- `cd1`, `cd2`, and similar multipart video naming.
+
+### Classification behavior
+
+A message may match more than one category. For example, a combined TV pack can also be a split file.
+
+Provide a configurable rule option:
+
+- ALL selected categories must match.
+- ANY selected category may match.
+
+Keep classification separate from routing rules so the classifier can be improved without changing the rule schema.
+
+Provide unit tests for common release names, ambiguous names, malformed filenames, and false positives.
+
+Do not require an external metadata API. The core classifier must work offline and must not claim to identify content from video frames or perform AI-based visual recognition.
+
+## 14. Caption Transformations
+
+Allow caption modifications in Copy mode.
+
+Provide:
+
+- Automatic clean-filename caption mode.
+- Remove links.
+- Remove `@usernames`.
+- Remove hashtags.
+- Remove emojis.
+- Remove decorative symbols.
+- Remove trailing promotional text after the filename extension.
+- Preserve multipart suffixes such as `.001`.
+- Custom header/prepend.
+- Custom footer/append.
+- Find-and-replace.
+- Regex-based replacements.
+- Case-sensitive replacements.
+
+Define the transformation order explicitly and make it deterministic.
+
+Example pipeline:
+
+1. Extract the original caption and filename.
+2. Apply optional cleanup operations.
+3. Apply custom find-and-replace transformations in their configured order.
+4. Add the configured header and footer.
+5. Validate the final caption against Telegram's supported message constraints.
+6. Send the transformed message.
+
+Preserve meaningful release information by default. Do not remove a filename extension or multipart suffix accidentally.
+
+Provide a preview of the transformed caption before saving the rule.
+
+Normal forward mode must preserve Telegram forwarding attribution. Copy mode must send a new message without the normal forwarded-from attribution and may apply caption transformations.
+
+Do not promise that all media types can be copied with arbitrary metadata intact. Document limitations involving albums, media captions, protected content, and Telegram API restrictions.
+
+## 15. Delivery Engine
+
+Implement a durable, asynchronous delivery queue.
+
+A delivery job should contain, as applicable:
+
+- Source peer identifier.
+- Source message identifier.
+- Rule identifier.
+- Destination peer identifier.
+- Delivery mode.
+- Current status.
+- Attempt count.
+- Next eligible execution time.
+- Creation and completion timestamps.
+- Last error.
+- Idempotency key.
+
+Suggested states:
+
+- Pending.
+- Processing.
+- Completed.
+- Skipped.
+- Failed.
+- Retry scheduled.
+- Cancelled.
+
+Use database transactions and idempotency controls so that application restarts do not unnecessarily duplicate sends.
+
+Do not claim exactly-once delivery if the Telegram API does not provide the required guarantees. Explain the remaining failure window between a successful Telegram send and local persistence of the result.
+
+### Delivery options
+
+Provide:
+
+- Normal forwarding mode.
+- Copy mode.
+- Per-rule delay from 0 to 120 seconds.
+- Configurable retries from 0 to 10.
+- Global send delay.
+- Minimum interval between sends.
+- Configurable concurrency, with conservative defaults.
+- Flood-wait-aware retry scheduling.
+- Cancellation of eligible queued jobs.
+- Per-destination delivery status.
+
+Do not retry non-retryable errors indefinitely.
+
+When Telegram returns a rate-limit response with a retry interval, defer the affected operation appropriately rather than repeatedly retrying it.
+
+Separate transient errors from permanent errors, such as invalid destinations, missing permissions, or unsupported operations.
+
+## 16. Duplicate Prevention
+
+Implement persistent deduplication.
+
+Support two scopes:
+
+### Per-rule
+
+A source message processed by one rule may still be processed by another rule.
+
+### Per-destination
+
+A source message must not be delivered repeatedly to the same destination merely because multiple matching rules route it there.
+
+Create database uniqueness constraints or equivalent transactional protections for delivery identities.
+
+Deduplication must survive:
+
+- Process restarts.
+- Docker container recreation.
+- Queue retries.
+- Backfill resumption.
+- Automatic catch-up.
+
+Document the deduplication key and how changed rules, edited source messages, and failed deliveries affect eligibility.
+
+Do not use a single global "message processed" flag that accidentally prevents valid deliveries to other destinations.
+
+## 17. Historical Backfill
+
+Implement a complete backfill subsystem for processing messages that already exist in a source chat.
+
+### Backfill modes
+
+1. All accessible messages.
+2. Last N messages, with N configurable from 50 to 5,000.
+3. Messages not previously processed in the applicable backfill scope.
+4. A selected message-ID range.
+
+For message-ID ranges, allow optional start and end IDs, with blank boundaries representing the relevant history boundary.
+
+Support:
+
+- Oldest-first processing.
+- Newest-first processing.
+- Dry-run preview.
+- Estimated message counts.
+- Estimated duration where meaningful.
+- Progress tracking.
+- Pause.
+- Resume.
+- Stop.
+- Restart from the beginning.
+- Automatic duplicate skipping.
+- Forwarded, skipped, and failed counts.
+- Current cursor or last processed message identifier.
+- Persistent job state.
+
+A backfill must resume from persisted state after a restart.
+
+Do not load thousands of messages into memory at once. Fetch and process bounded pages or batches.
+
+### Backfill preview
+
+Before execution, show:
+
+- Source chat.
+- Selected range.
+- Number of messages examined.
+- Number matching rules.
+- Number expected to be skipped.
+- Destination breakdown.
+- Expected delivery mode.
+- Any obvious configuration errors.
+
+Preview must not send messages.
+
+### Backfill execution
+
+Use the same rule engine, category classifier, sender filters, content filters, scheduling rules, and transformations as live processing.
+
+Persist progress incrementally. A crash must not require restarting the entire history scan.
+
+Make backfill rate limiting configurable and coordinate it with the shared delivery queue.
+
+If the Telegram library does not support a required history operation, document the limitation and provide a clearly defined fallback rather than silently returning incomplete results.
+
+## 18. Automatic and Manual Catch-Up
+
+Implement recovery of messages missed while the application was offline or disconnected.
+
+### Automatic catch-up
+
+Provide an `auto_catchup_on_startup` setting, disabled by default.
+
+When enabled and forwarding is active:
+
+1. Reconnect the Telegram session.
+2. Determine the last reliably processed source-message position.
+3. Identify messages that arrived after that position.
+4. Process them through the normal routing engine.
+5. Deduplicate against existing deliveries.
+6. Resume live processing.
+
+### Manual catch-up
+
+When automatic catch-up is disabled, provide a manual action in the dashboard.
+
+The action should show the source chat, detected gap, estimated work, and recovery status where those details can be determined.
+
+### Cursor management
+
+Maintain source-specific progress markers. Do not rely solely on timestamps because multiple messages can share a timestamp or arrive out of order.
+
+Handle reconnects, pagination, message-ID gaps, deleted messages, and overlapping recovery windows.
+
+Make recovery idempotent and persist progress as work completes.
+
+Acknowledge that Telegram history access, retention, API behavior, and library limitations may prevent complete recovery in some circumstances.
+
+## 19. Source Edit and Delete Synchronization
+
+Support optional source-to-destination synchronization.
+
+### Edit synchronization
+
+When the source message changes:
+
+1. Identify previously created destination copies or forwards.
+2. Determine whether the delivery mode permits editing the destination message.
+3. Update supported destination messages.
+4. Record unsupported operations or failures.
+
+### Delete synchronization
+
+When a source message is deleted:
+
+1. Identify the tracked destination messages.
+2. Delete those that the Telegram API permits the account to delete.
+3. Record successful and failed deletions.
+
+Maintain a mapping between the source message and every destination message created by the application.
+
+Do not attempt to modify arbitrary messages not created or tracked by this application.
+
+Account for albums, grouped media, messages with captions, and destinations where the account lacks edit/delete permissions.
+
+Synchronization must be configurable globally and per rule.
+
+## 20. Scheduling
+
+Each rule must support a schedule.
+
+Provide:
+
+- Start time.
+- End time.
+- Selected days of the week.
+- Overnight windows crossing midnight.
+- An explicit timezone.
+
+The UI must use the selected timezone consistently. Default to UTC unless the user configures another timezone.
+
+Use an established timezone library rather than manually implementing daylight-saving-time calculations.
+
+Define how schedules apply to live messages and historical backfill. A user must be able to tell whether a schedule means "only forward messages arriving during these hours" or "allow a queued message to be sent only during these hours."
+
+Use a clear default and make the behavior configurable if both interpretations are useful.
+
+## 21. Operational Logs and Statistics
+
+### Logs
+
+Provide a searchable, paginated log viewer with filters for:
+
+- Time range.
+- Source chat.
+- Destination chat.
+- Rule.
+- Event type.
+- Success, skip, warning, or failure.
+- Error category.
+- Message identifier.
+
+Each record should include a timestamp, rule, relevant chat identifiers, operation, status, and a useful diagnostic message.
+
+Redact API credentials, login codes, passwords, session strings, encryption keys, and other sensitive data.
+
+Avoid storing full message contents in logs by default.
+
+### Statistics
+
+Provide:
+
+- Total successful deliveries.
+- Total skipped messages.
+- Total failures.
+- Pending queue size.
+- Retry count.
+- Per-rule statistics.
+- Per-destination statistics.
+- Recent activity.
+- Backfill and catch-up summaries.
+- Processing duration and queue latency where measurable.
+
+Persist the underlying event counters or records. Explain how statistics behave after log cleanup and database restoration.
+
+Use pagination and bounded queries so large log tables do not cause excessive memory use.
+
+## 22. Settings
+
+Provide a settings page with the following options:
+
+- Global forwarding enable/disable.
+- Start-on-application-restart behavior.
+- Automatic catch-up.
+- Duplicate protection.
+- Deduplication scope.
+- Global send delay.
+- Minimum send interval.
+- Delivery concurrency.
+- Queue limits.
+- Default retry count.
+- Log retention.
+- Database maintenance options.
+- Theme: System, Light, or Dark.
+- Telegram connection management.
+- Encryption-key configuration guidance.
+- Export and import.
+- Application version and diagnostics.
+
+There is no Android boot receiver in this product. On a VPS, the equivalent requirement is to restart the application automatically after a host or container restart through Docker's restart policy and service initialization.
+
+Do not implement a fake "Start on boot" setting that has no actual effect.
+
+## 23. Rule Export, Import, and Recipes
+
+Implement JSON export and import for rules.
+
+Export must include the complete rule configuration, filters, categories, destinations, schedules, delivery settings, and caption transformations.
+
+Do not export Telegram login codes, passwords, API hashes, or decrypted session material.
+
+On import:
+
+- Validate the schema.
+- Reject malformed data safely.
+- Provide a preview.
+- Detect duplicate identifiers.
+- Offer a safe remapping strategy for conflicting IDs.
+- Validate source and destination references.
+- Display unresolved chats.
+- Require confirmation before replacing existing rules.
+
+Include four optional example configurations:
+
+1. `simple-mirror.json`: Mirror all eligible messages from one chat to another.
+2. `movies-clean-captions.json`: Route movie messages in Copy mode with cleaned captions.
+3. `keyword-and-schedule.json`: Select specified video qualities and minimum file sizes, exclude samples and advertisements, and restrict delivery to an overnight schedule.
+4. `media-routing-rules.json`: Route movies, split movies, TV shows, split TV shows, combined TV packs, and combined split TV packs using ordered rules.
+
+Provide placeholder identifiers and explain how to replace them with real chat IDs.
+
+## 24. Web API
+
+Create a versioned REST API, such as `/api/v1`.
+
+Implement endpoints for:
+
+- Application status.
+- Telegram authentication and connection state.
+- Chat listing and search.
+- Rule CRUD operations.
+- Rule testing.
+- Rule import and export.
+- Global settings.
+- Queue inspection.
+- Queue-job cancellation where safe.
+- Backfill creation, preview, pause, resume, stop, and restart.
+- Catch-up initiation and status.
+- Log search and pagination.
+- Statistics.
+- Health and readiness.
+
+Use typed request and response structures, consistent error codes, input validation, and bounded request sizes.
+
+Expose a WebSocket or server-sent events endpoint for real-time status, logs, and job progress where useful. Authenticate these connections and avoid unnecessary event flooding.
+
+Do not expose unrestricted internal database operations through the API.
+
+## 25. Web Interface and User Experience
+
+The web interface should feel like a mature self-hosted administration panel.
+
+Design requirements:
+
+- Responsive desktop and mobile layouts.
+- Clear visual hierarchy.
+- Accessible forms and controls.
+- Dark and light themes.
+- Persistent navigation.
+- Searchable tables.
+- Pagination.
+- Loading states.
+- Empty states.
+- Inline validation.
+- Confirmation dialogs for destructive actions.
+- Toast notifications for completed operations.
+- Visible error messages.
+- Real-time progress for long-running jobs.
+- Clear connected/disconnected states.
+- No fake statistics.
+- No dead buttons.
+- No placeholder screens presented as completed functionality.
+
+The dashboard must remain usable if the Telegram connection is unavailable.
+
+Long-running tasks must continue on the server when the browser is closed. Reopening the page should show their actual persisted status.
+
+## 26. Security Requirements
+
+This application will hold credentials for a personal Telegram account. Security is a core requirement.
+
+Implement:
+
+- An administrative authentication mechanism for the web interface.
+- Secure password hashing using a suitable modern algorithm.
+- Session cookies with HttpOnly, Secure when HTTPS is used, and appropriate SameSite attributes.
+- CSRF protection where applicable.
+- Rate limiting on login and sensitive endpoints.
+- Strict input validation.
+- Protection against unauthorized cross-origin requests.
+- Safe file upload handling.
+- Protection against path traversal and arbitrary file access.
+- Encryption of Telegram session material at rest.
+- Secrets supplied through environment variables or protected secret files.
+- Redaction of credentials and message content from logs.
+- Non-root Docker execution.
+- Minimal container privileges.
+- No Docker socket exposure.
+- No unnecessary host filesystem mounts.
+- No public database port by default.
+- Safe HTTP security headers.
+- Dependency auditing and vulnerability checks.
+- Secure defaults for reverse-proxy deployments.
+
+Require an explicit initial administrator setup. Do not ship default administrator credentials.
+
+Do not expose the administration interface publicly without authentication.
+
+Document that anyone possessing the Telegram session or its decryption key may be able to impersonate the account.
+
+Do not attempt to bypass Telegram's protected-content restrictions or access controls.
+
+## 27. Database Design
+
+Design normalized, indexed tables for at least:
+
+- Application settings.
+- Telegram account metadata.
+- Encrypted Telegram session.
+- Chats.
+- Rules.
+- Rule destinations.
+- Rule filters.
+- Category settings.
+- Caption transformations.
+- Delivery jobs.
+- Delivery attempts.
+- Source-to-destination message mappings.
+- Deduplication records.
+- Source processing cursors.
+- Backfill jobs.
+- Catch-up jobs.
+- Application events.
+- Statistics or aggregate counters.
+
+Use migrations and foreign-key constraints where appropriate.
+
+Use transactions for operations that must be atomic, especially rule updates, job creation, delivery bookkeeping, and deduplication.
+
+Do not put all rules, logs, and delivery history into one unstructured JSON database field.
+
+For SQLite:
+
+- Enable WAL mode where appropriate.
+- Set a busy timeout.
+- Use prepared statements.
+- Keep transactions short.
+- Avoid long-lived write transactions during history scans.
+- Add indexes for common queries.
+- Provide a backup procedure that safely handles an active database.
+
+Do not claim that SQLite supports multiple independent application replicas with unrestricted concurrent writes.
+
+## 28. Low-Memory and Performance Requirements
+
+Memory efficiency is a first-class objective.
+
+Design for a small VPS, initially targeting a single active Telegram account and a modest number of rules.
+
+Use these design principles:
+
+- Bounded asynchronous queues.
+- Backpressure when the delivery queue is full.
+- Bounded message-history batches.
+- Streaming database reads where useful.
+- No loading entire chat histories into memory.
+- No unbounded spawned Tokio tasks.
+- Controlled concurrency.
+- Reuse the Telegram connection.
+- Avoid excessive polling.
+- Paginate logs and statistics.
+- Limit cached chat metadata.
+- Avoid unnecessary message-body retention.
+- Use efficient database indexes.
+- Use release builds and a minimal runtime image.
+- Gracefully drain workers during shutdown.
+- Reuse HTTP clients and other expensive resources.
+- Avoid unnecessary cloning of large message structures.
+- Avoid heavy ORM frameworks unless there is a demonstrated benefit.
+
+Provide configurable memory-conscious limits for concurrent operations, batch size, and queue depth.
+
+Explain the trade-offs between latency, throughput, memory, and rate limiting.
+
+Do not promise a specific RAM footprint without measuring it. Provide reproducible benchmarking instructions using representative workloads and report idle, normal-load, and backfill memory consumption.
+
+## 29. Docker Deployment
+
+Provide a complete deployment package.
+
+Required files:
+
+- `Dockerfile`
+- `compose.yaml`
+- `.dockerignore`
+- `.env.example`
+- Database migrations.
+- Startup scripts only where necessary.
+- Health-check implementation.
+- README with setup and maintenance instructions.
+
+The default Compose configuration must:
+
+- Build or run the application image.
+- Mount persistent application data.
+- Restart automatically after failures and host restarts.
+- Run as a non-root user.
+- Avoid publishing unnecessary ports.
+- Expose only the intended web interface.
+- Provide a health check.
+- Support graceful shutdown.
+- Use environment variables for configuration.
+- Avoid storing secrets in the image.
+- Support upgrades without deleting persistent data.
+
+Provide examples for:
+
+1. Direct local access.
+2. Access behind a reverse proxy with HTTPS.
+3. Optional PostgreSQL deployment.
+4. Backup and restoration.
+5. Updating the container.
+6. Troubleshooting Telegram authentication.
+7. Recovering from an invalid Telegram session.
+
+The default installation should not require Redis, a separate message broker, or an external database server.
+
+Document a sensible persistent directory layout and permissions.
+
+## 30. Reliability and Error Handling
+
+Implement explicit handling for:
+
+- Telegram disconnections.
+- Expired sessions.
+- Authentication failures.
+- Flood-wait responses.
+- Network timeouts.
+- Database errors.
+- Invalid destinations.
+- Missing chat permissions.
+- Malformed rules.
+- Invalid regular expressions.
+- Unsupported media.
+- Failed caption edits.
+- Failed deletions.
+- Duplicate delivery attempts.
+- Interrupted backfill.
+- Interrupted catch-up.
+- Container shutdown.
+- Database migrations that fail.
+
+Errors must be visible and actionable.
+
+Use bounded exponential backoff with jitter for appropriate transient failures. Respect Telegram-supplied retry intervals.
+
+Do not repeatedly retry permanent errors.
+
+Implement graceful shutdown so new work stops being accepted, in-flight work is handled safely, and incomplete jobs remain recoverable.
+
+## 31. Testing Requirements
+
+Provide automated tests for the backend and frontend.
+
+### Unit tests
+
+Test:
+
+- Every message-type filter.
+- Sender filters.
+- Required and excluded keywords.
+- Regex behavior.
+- Filename and file-size conditions.
+- ALL/ANY category logic.
+- Movie, TV, combined, and split classification.
+- Caption cleanup.
+- Replacement ordering.
+- Scheduling, including midnight crossings.
+- Rule priority.
+- Exclusive-stop behavior.
+- Duplicate protection.
+- Retry classification.
+- Queue pacing.
+
+### Integration tests
+
+Test:
+
+- Rule CRUD.
+- Database migrations.
+- Import and export.
+- Queue persistence.
+- Application restart recovery.
+- Backfill cursor persistence.
+- Catch-up recovery.
+- Destination deduplication.
+- Administrative authentication.
+- Authorization and access-control boundaries.
+
+### Telegram integration tests
+
+Separate unit tests from real Telegram integration tests.
+
+Provide a safe way to run integration tests against a dedicated test account and test chats. Do not require personal production credentials for the normal test suite.
+
+Do not simulate successful Telegram deliveries in production code.
+
+### Build verification
+
+The final project must pass:
+
+- Rust formatting.
+- Clippy checks.
+- Backend unit tests.
+- Frontend type checking.
+- Frontend production build.
+- Docker image build.
+- Database migration checks.
+
+Document any checks that cannot run in the available development environment.
+
+## 32. Development Workflow and Implementation Order
+
+Do not generate a huge, untested code dump.
+
+Implement the application in verified phases.
+
+### Phase 1: Architecture and feasibility
+
+- Verify the Rust Telegram MTProto library.
+- List supported and unsupported Telegram operations.
+- Define the module boundaries.
+- Define database schemas.
+- Define the REST API.
+- Define the delivery and recovery state machines.
+- Explain any unavoidable compromises.
+
+### Phase 2: Functional foundation
+
+- Create the Rust backend.
+- Create the React frontend.
+- Implement migrations.
+- Implement administrative authentication.
+- Implement application settings.
+- Implement Telegram authentication.
+- Implement chat listing.
+- Add Docker Compose.
+- Verify startup and persistence.
+
+### Phase 3: Rules and filtering
+
+- Implement rule CRUD.
+- Implement priority and exclusive-stop behavior.
+- Implement all filters.
+- Implement category classification.
+- Implement caption transformations.
+- Implement rule testing.
+- Add comprehensive tests.
+
+### Phase 4: Live forwarding
+
+- Implement the message-update listener.
+- Implement the routing engine.
+- Implement the durable delivery queue.
+- Implement forward and copy modes.
+- Implement duplicate protection.
+- Implement retry and flood-wait handling.
+- Verify end-to-end delivery against a real test account.
+
+### Phase 5: Historical processing
+
+- Implement backfill modes.
+- Implement dry-run previews.
+- Implement progress reporting.
+- Implement pause, resume, stop, and restart.
+- Implement automatic and manual catch-up.
+- Test crash recovery.
+
+### Phase 6: Synchronization and observability
+
+- Implement edit/delete synchronization.
+- Implement logs.
+- Implement statistics.
+- Implement real-time dashboard updates.
+- Implement health and diagnostic endpoints.
+
+### Phase 7: Production hardening
+
+- Review secrets handling.
+- Audit authorization.
+- Test backup and restoration.
+- Test restart recovery.
+- Benchmark memory usage.
+- Run dependency audits.
+- Validate the Docker deployment.
+- Write complete operational documentation.
+
+At the end of every phase, provide the actual changed files, explain the implementation, run the relevant checks, and fix failures before proceeding.
+
+## 33. Output and Deliverables
+
+Deliver a complete working repository with:
+
+1. Full Rust source code.
+2. Full frontend source code.
+3. Database migrations.
+4. Dockerfile.
+5. Docker Compose configuration.
+6. Example environment configuration.
+7. Automated tests.
+8. Example rule recipes.
+9. API documentation.
+10. Deployment instructions.
+11. Upgrade instructions.
+12. Backup and restoration instructions.
+13. Security documentation.
+14. Telegram API limitations.
+15. Troubleshooting guide.
+16. Performance and benchmarking instructions.
+
+Include a feature-completion matrix indicating:
+
+- Implemented and tested.
+- Implemented but not tested against Telegram.
+- Partially implemented.
+- Unsupported by the selected library.
+- Not implemented.
+
+Do not label the product complete while major features remain mocked or unimplemented.
+
+## 34. Mandatory Engineering Constraints
+
+- Prefer Rust for all server-side application logic.
+- Do not use a bot-only Telegram integration as a substitute for personal-account MTProto access.
+- Do not expose Telegram credentials or session data to the frontend.
+- Do not use in-memory-only queues for critical delivery work.
+- Do not load entire histories into RAM.
+- Do not claim exactly-once delivery without a defensible implementation.
+- Do not silently ignore failed filters or Telegram operations.
+- Do not bypass Telegram access controls.
+- Do not implement fake progress or fabricated statistics.
+- Do not add unnecessary infrastructure that increases RAM consumption.
+- Do not omit database migrations or deployment configuration.
+- Do not assume a browser must remain open for background processing.
+- Do not assume Android-specific background behavior exists on a VPS.
+- Do not claim features are implemented until the relevant code and tests exist.
+
+## 35. First Response Expected from You
+
+Before writing the full application, return:
+
+1. A concise architecture proposal.
+2. A feasibility assessment of the selected Rust MTProto library against every required Telegram operation.
+3. The proposed database schema.
+4. The proposed repository structure.
+5. The REST API outline.
+6. The delivery-queue and deduplication design.
+7. The backfill and catch-up recovery design.
+8. The Docker deployment design.
+9. A list of known technical risks and unsupported features.
+10. The phased implementation plan.
+
+Then begin Phase 1 and proceed through the project incrementally.
+
+The goal is a genuinely deployable, memory-efficient, secure, self-hosted Telegram automation platform—not a demonstration that merely looks complete.

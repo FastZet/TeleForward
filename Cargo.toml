@@ -1,0 +1,63 @@
+[package]
+name = "teleroute"
+version = "1.0.0"
+edition = "2021"
+rust-version = "1.80"
+description = "Self-Hosted Telegram MTProto Automation and Intelligent Message Routing Platform"
+license = "MIT"
+
+[[bin]]
+name = "teleroute"
+path = "src-rust/main.rs"
+
+[lib]
+name = "teleroute_core"
+path = "src-rust/lib.rs"
+
+[dependencies]
+# Asynchronous runtime & HTTP server
+tokio = { version = "=1.41.1", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "fs", "net"] }
+axum = { version = "=0.7.9", features = ["ws", "macros", "json"] }
+tower = { version = "=0.5.1", features = ["limit", "timeout", "util"] }
+tower-http = { version = "=0.6.2", features = ["fs", "cors", "trace", "set-header", "limit"] }
+
+# Database & Migrations (SQLite WAL default + optional PostgreSQL)
+sqlx = { version = "=0.8.2", features = ["runtime-tokio-rustls", "sqlite", "postgres", "chrono", "migrate", "macros"] }
+
+# Telegram MTProto Client API (Personal Account)
+grammers-client = "=0.7.0"
+grammers-session = "=0.7.0"
+grammers-tl-types = "=0.7.0"
+grammers-mtsender = "=0.7.0"
+
+# Serialization, Validation & Regex (Linear time DFA/NFA engine — immune to ReDoS)
+serde = { version = "=1.0.215", features = ["derive"] }
+serde_json = "=1.0.133"
+regex = "=1.11.1"
+
+# Timezone & Scheduling (IANA Olson database)
+chrono = { version = "=0.4.38", features = ["serde"] }
+chrono-tz = "=0.10.0"
+
+# Security & Cryptography (Argon2id + AES-256-GCM + SHA-256 + CSPRNG)
+argon2 = "=0.5.3"
+aes-gcm = "=0.10.3"
+sha2 = "=0.10.8"
+rand = "=0.8.5"
+base64 = "=0.22.1"
+zeroize = { version = "=1.8.1", features = ["derive"] }
+
+# Observability & Diagnostics
+tracing = "=0.1.40"
+tracing-subscriber = { version = "=0.3.18", features = ["env-filter", "json"] }
+thiserror = "=2.0.3"
+uuid = { version = "=1.11.0", features = ["v4", "serde"] }
+futures-util = "=0.3.31"
+async-trait = "=0.1.83"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"

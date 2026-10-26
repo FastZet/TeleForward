@@ -1,0 +1,74 @@
+{
+  "schema_version": 1,
+  "recipe_name": "keyword-and-schedule",
+  "description": "Select 2160p/4K UHD releases above 500 MB, exclude samples and advertisements, and restrict delivery to an overnight schedule window (23:00 to 06:00 UTC).",
+  "placeholder_instructions": "Replace '-1001000000001' with your source channel peer ID and '-1002000000202' with your 4K UHD destination peer ID.",
+  "rules": [
+    {
+      "id": "recipe-4k-overnight-01",
+      "name": "2160p UHD Overnight Delivery",
+      "description": "Requires 2160p/UHD/4K keywords, minimum 500 MB .mkv container, skips samples/ads, and defers delivery to 23:00-06:00 overnight window.",
+      "enabled": true,
+      "source_peer_id": "-1001000000001",
+      "destination_peer_ids": ["-1002000000202"],
+      "priority": 75,
+      "secondary_order": 1,
+      "exclusive_stop": false,
+      "delivery_mode": "COPY",
+      "delay_seconds": 5,
+      "max_retries": 5,
+      "sync_edits": true,
+      "sync_deletes": true,
+      "deduplication_override": "PER_DESTINATION",
+      "schedule": {
+        "enabled": true,
+        "start_time": "23:00",
+        "end_time": "06:00",
+        "days": [0, 1, 2, 3, 4, 5, 6],
+        "timezone": "UTC",
+        "behavior": "DEFER_UNTIL_WINDOW"
+      },
+      "filters": {
+        "message_type_filter": "DOCUMENT",
+        "album_policy": "PROCESS_ITEMS",
+        "sender_filter_mode": "ANY",
+        "sender_user_ids": [],
+        "missing_sender_policy": "ALLOW_IN_CHANNELS",
+        "required_keywords": ["2160p", "4K", "UHD"],
+        "required_keywords_match_mode": "ANY",
+        "excluded_keywords": ["sample", "promo", "sponsored", "advertisement", "betting"],
+        "regex_pattern": "(2160p|4K|UHD).*(BluRay|WEB-DL|Remux)",
+        "regex_exclude_pattern": "(?i)(sample|trailer)",
+        "keyword_search_target": "TEXT_CAPTION_AND_FILENAME",
+        "case_sensitive": false,
+        "whole_word": false,
+        "min_file_size_mb": 500,
+        "max_file_size_mb": 85000,
+        "filename_contains": "2160p",
+        "filename_ends_with": ".mkv",
+        "filename_regex": "",
+        "accepted_extensions": [".mkv"],
+        "excluded_extensions": [".nfo", ".txt", ".jpg"],
+        "missing_file_metadata_policy": "FAIL_FILTER"
+      },
+      "categories": {
+        "enabled": false,
+        "selected": [],
+        "match_mode": "ANY"
+      },
+      "caption_transform": {
+        "clean_filename_mode": false,
+        "remove_links": true,
+        "remove_usernames": true,
+        "remove_hashtags": false,
+        "remove_emojis": false,
+        "remove_decorative_symbols": true,
+        "strip_text_after_extension": true,
+        "preserve_multipart_suffix": true,
+        "custom_header": "",
+        "custom_footer": "",
+        "replacements": []
+      }
+    }
+  ]
+}
