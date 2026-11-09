@@ -5,42 +5,44 @@ TeleForward asynchronous database engine configuration.
 Supports:
 - SQLite through aiosqlite.
 - PostgreSQL through asyncpg.
-
-Provides connection pooling, SQLite integrity settings and
-centralised engine lifecycle management.
+- SQLite foreign-key enforcement.
+- SQLite connection timeout and busy-timeout configuration.
+- Connection pooling and health checks.
 """
 
 from functools import lru_cache
 
 from sqlalchemy import event
+from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     create_async_engine,
 )
 
 from app.core.config import get_settings
-from app.core.exceptions import ConfigurationError
+
+
+SQLITE_CONNECT_TIMEOUT = 30
+SQLITE_BUSY_TIMEOUT_MS = 30_000
 
 
 def _configure_sqlite_engine(engine: AsyncEngine) -> None:
-    """
-    Configure SQLite connection-level settings.
-
-    SQLite foreign-key enforcement is disabled by default.
-    Enable it on every new connection.
-    """
+    """Apply SQLite-specific connection settings."""
 
     @event.listens_for(engine.sync_engine, "connect")
-    def set_sqlite_pragmas(
+    def _set_sqlite_pragmas(
         dbapi_connection,
         connection_record,
     ) -> None:
-        """Apply SQLite PRAGMA settings to each connection."""
+        """Enable SQLite foreign keys and configure busy timeout."""
+
         cursor = dbapi_connection.cursor()
 
         try:
             cursor.execute("PRAGMA foreign_keys=ON")
-            cursor.execute("PRAGMA busy_timeout=30000")
+            cursor.execute(
+                f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}"
+            )
         finally:
             cursor.close()
 
@@ -48,62 +50,57 @@ def _configure_sqlite_engine(engine: AsyncEngine) -> None:
 @lru_cache(maxsize=1)
 def get_database_engine() -> AsyncEngine:
     """
-    Return the cached asynchronous SQLAlchemy engine.
+    Return the application's cached asynchronous database engine.
 
-    The database URL is obtained from application settings.
-    Unsupported database drivers raise ConfigurationError.
+    The engine is created lazily and reused throughout the
+    application's lifetime.
     """
+
     settings = get_settings()
     database_url = settings.effective_database_url
+    url = make_url(database_url)
 
-    if not database_url:
-        raise ConfigurationError(
-            "A database connection URL must be configured."
-        )
-
-    common_options = {
-        "echo": False,
+    engine_options = {
+        "echo": settings.database_echo,
         "pool_pre_ping": True,
     }
 
-    if database_url.startswith("sqlite+aiosqlite://"):
-        engine = create_async_engine(
-            database_url,
-            connect_args={
-                "timeout": 30,
-            },
-            **common_options,
+    if url.get_backend_name() == "sqlite":
+        engine_options["connect_args"] = {
+            "timeout": SQLITE_CONNECT_TIMEOUT,
+        }
+
+    else:
+        engine_options.update(
+            {
+                "pool_size": settings.database_pool_size,
+                "max_overflow": settings.database_max_overflow,
+                "pool_timeout": settings.database_pool_timeout,
+                "pool_recycle": settings.database_pool_recycle,
+            }
         )
 
+    engine = create_async_engine(
+        database_url,
+        **engine_options,
+    )
+
+    if url.get_backend_name() == "sqlite":
         _configure_sqlite_engine(engine)
 
-        return engine
-
-    if database_url.startswith("postgresql+asyncpg://"):
-        return create_async_engine(
-            database_url,
-            pool_size=10,
-            max_overflow=20,
-            pool_timeout=30,
-            pool_recycle=1800,
-            **common_options,
-        )
-
-    raise ConfigurationError(
-        "Unsupported database URL. "
-        "Supported drivers are sqlite+aiosqlite and "
-        "postgresql+asyncpg."
-    )
+    return engine
 
 
 async def dispose_database_engine() -> None:
     """
-    Dispose the cached database engine.
+    Dispose the cached engine and clear its cache.
 
-    This closes pooled connections during application shutdown.
+    This function should be called during application shutdown.
     """
+
     engine = get_database_engine()
 
-    await engine.dispose()
-
-    get_database_engine.cache_clear()
+    try:
+        await engine.dispose()
+    finally:
+        get_database_engine.cache_clear()
