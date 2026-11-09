@@ -1,112 +1,120 @@
 
 """
-TeleForward application health checks.
+TeleForward application health monitoring.
 
-Provides liveness, readiness and detailed health information
-for container orchestration and operational monitoring.
+Provides:
+- Application liveness checks.
+- Application readiness checks.
+- Detailed dependency health diagnostics.
 """
 
-from datetime import UTC, datetime
+import logging
+from datetime import datetime, timezone
 from typing import Any
 
-import structlog
 from fastapi import Request
-from sqlalchemy import text
-from sqlalchemy.ext.asyncio import AsyncEngine
 
-logger = structlog.get_logger(__name__)
+from app import __app_name__, __version__
+from app.database.health import (
+    check_database_connection,
+    get_database_diagnostics,
+)
 
 
-def get_uptime_timestamp() -> str:
-    """Return the current UTC timestamp."""
-    return datetime.now(UTC).isoformat()
+logger = logging.getLogger(__name__)
 
 
 def get_liveness_status() -> dict[str, Any]:
     """
-    Return the application's liveness status.
+    Return application liveness information.
 
-    This endpoint should remain lightweight and should not
-    depend on database or external service availability.
+    Liveness does not depend on database availability.
     """
     return {
         "status": "alive",
-        "timestamp": get_uptime_timestamp(),
+        "application": __app_name__,
+        "version": __version__,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
 
 def get_readiness_status(request: Request) -> dict[str, Any]:
     """
-    Return the application's readiness status.
+    Check whether the application has completed startup.
 
-    The lifecycle manager marks the application as ready
-    after successful startup initialisation.
+    The lifecycle manager must explicitly set app.state.ready
+    after all critical startup operations succeed.
     """
-    ready = getattr(request.app.state, "ready", False)
-
-    return {
-        "status": "ready" if ready else "not_ready",
-        "timestamp": get_uptime_timestamp(),
-    }
-
-
-async def check_database_health(
-    engine: AsyncEngine | None,
-) -> dict[str, Any]:
-    """
-    Check database connectivity.
-
-    Args:
-        engine: Configured asynchronous SQLAlchemy engine.
-
-    Returns:
-        Database health information.
-    """
-    if engine is None:
-        return {
-            "status": "not_configured",
-        }
-
-    try:
-        async with engine.connect() as connection:
-            await connection.execute(text("SELECT 1"))
-
-        return {
-            "status": "healthy",
-        }
-
-    except Exception:
-        logger.exception("database_health_check_failed")
-
-        return {
-            "status": "unhealthy",
-        }
-
-
-async def get_detailed_health(
-    request: Request,
-) -> dict[str, Any]:
-    """
-    Return detailed application health information.
-
-    Checks the database if an engine has been registered
-    in the FastAPI application state.
-    """
-    engine = getattr(request.app.state, "database_engine", None)
-
-    database = await check_database_health(engine)
-
-    components = {
-        "database": database,
-    }
-
-    overall_healthy = all(
-        component["status"] in ("healthy", "not_configured")
-        for component in components.values()
+    ready = bool(
+        getattr(request.app.state, "ready", False)
     )
 
     return {
-        "status": "healthy" if overall_healthy else "degraded",
-        "timestamp": get_uptime_timestamp(),
-        "components": components,
+        "status": "ready" if ready else "not_ready",
+        "application": __app_name__,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+async def get_detailed_health() -> dict[str, Any]:
+    """
+    Return detailed application dependency diagnostics.
+
+    Database availability is considered a critical dependency.
+    """
+    database_health = await check_database_connection()
+    database_diagnostics = await get_database_diagnostics()
+
+    dependencies = {
+        "database": {
+            **database_health,
+            "diagnostics": database_diagnostics,
+        }
+    }
+
+    dependency_statuses = [
+        dependency.get("status")
+        for dependency in dependencies.values()
+    ]
+
+    healthy = all(
+        status == "healthy"
+        for status in dependency_statuses
+    )
+
+    return {
+        "status": "healthy" if healthy else "degraded",
+        "application": __app_name__,
+        "version": __version__,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "dependencies": dependencies,
+    }
+
+
+async def get_application_health(
+    request: Request,
+) -> dict[str, Any]:
+    """
+    Combine application readiness and dependency health.
+
+    This is intended for administrative diagnostics rather
+    than the lightweight container liveness probe.
+    """
+    readiness = get_readiness_status(request)
+    detailed_health = await get_detailed_health()
+
+    ready = readiness["status"] == "ready"
+    healthy = detailed_health["status"] == "healthy"
+
+    if ready and healthy:
+        overall_status = "healthy"
+    elif not ready:
+        overall_status = "not_ready"
+    else:
+        overall_status = "degraded"
+
+    return {
+        "status": overall_status,
+        "readiness": readiness,
+        "health": detailed_health,
     }
