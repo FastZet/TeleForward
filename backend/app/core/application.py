@@ -2,198 +2,224 @@
 """
 TeleForward FastAPI application factory.
 
-Creates and configures the main FastAPI application, including
-middleware, exception handlers, health endpoints and API metadata.
+Creates and configures the application instance, middleware,
+exception handlers, health endpoints, and application lifespan.
 """
 
-from fastapi import APIRouter, FastAPI, Request, Response, status
+import logging
+from contextlib import AbstractAsyncContextManager
+from typing import Any, Callable
+
+from fastapi import FastAPI, Request, Response
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.trustedhost import TrustedHostMiddleware
+from fastapi.responses import JSONResponse
 from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
 
+from app import __app_name__, __version__
 from app.core.config import get_settings
+from app.core.csrf import (
+    CSRFMiddleware,
+)
 from app.core.exception_handlers import register_exception_handlers
 from app.core.health import (
+    get_application_health,
     get_detailed_health,
     get_liveness_status,
     get_readiness_status,
 )
 from app.core.lifecycle import application_lifespan
-from app.core.middleware import get_middleware_stack
+from app.core.middleware import (
+    RequestContextMiddleware,
+    RequestLoggingMiddleware,
+    SecurityHeadersMiddleware,
+)
 from app.core.rate_limiter import limiter
 
 
-# ============================================================
-# Health router
-# ============================================================
-
-health_router = APIRouter(tags=["Health"])
+logger = logging.getLogger(__name__)
 
 
-@health_router.get(
-    "/health",
-    summary="Application health check",
-    description="Lightweight liveness endpoint for container monitoring.",
-    status_code=status.HTTP_200_OK,
-)
-async def health_check() -> dict:
-    """
-    Return application liveness status.
+async def rate_limit_exception_handler(
+    request: Request,
+    exc: RateLimitExceeded,
+) -> JSONResponse:
+    """Return a consistent JSON response for rate-limit violations."""
+    retry_after = getattr(exc, "retry_after", None)
 
-    This endpoint intentionally avoids database and external
-    service checks so Docker can use it as a lightweight probe.
-    """
-    return get_liveness_status()
+    headers: dict[str, str] = {}
 
-
-@health_router.get(
-    "/health/live",
-    summary="Application liveness",
-    status_code=status.HTTP_200_OK,
-)
-async def liveness_check() -> dict:
-    """Return whether the application process is alive."""
-    return get_liveness_status()
-
-
-@health_router.get(
-    "/health/ready",
-    summary="Application readiness",
-)
-async def readiness_check(request: Request) -> Response:
-    """Return whether the application is ready to accept requests."""
-    result = get_readiness_status(request)
-
-    response_status = (
-        status.HTTP_200_OK
-        if result["status"] == "ready"
-        else status.HTTP_503_SERVICE_UNAVAILABLE
-    )
-
-    from fastapi.responses import JSONResponse
+    if retry_after is not None:
+        headers["Retry-After"] = str(retry_after)
 
     return JSONResponse(
-        status_code=response_status,
-        content=result,
+        status_code=429,
+        content={
+            "success": False,
+            "error": {
+                "code": "RATE_LIMIT_EXCEEDED",
+                "message": "Too many requests. Please try again later.",
+            },
+        },
+        headers=headers,
     )
 
 
-@health_router.get(
-    "/health/details",
-    summary="Detailed application health",
-)
-async def detailed_health_check(request: Request) -> Response:
+def create_application(
+    lifespan: Callable[
+        [FastAPI],
+        AbstractAsyncContextManager[Any],
+    ] | None = None,
+) -> FastAPI:
     """
-    Return the health status of registered infrastructure.
+    Construct and configure a TeleForward application instance.
 
-    Internal component details are intended for operational
-    monitoring and should not be exposed publicly without
-    appropriate access controls.
-    """
-    result = await get_detailed_health(request)
-
-    response_status = (
-        status.HTTP_200_OK
-        if result["status"] == "healthy"
-        else status.HTTP_503_SERVICE_UNAVAILABLE
-    )
-
-    from fastapi.responses import JSONResponse
-
-    return JSONResponse(
-        status_code=response_status,
-        content=result,
-    )
-
-
-# ============================================================
-# Application factory
-# ============================================================
-
-def create_application() -> FastAPI:
-    """
-    Create and configure the TeleForward FastAPI application.
-
-    Returns:
-        Configured FastAPI application instance.
+    A lifespan can be supplied explicitly for testing. Otherwise,
+    the production application lifespan is used.
     """
     settings = get_settings()
 
-    app = FastAPI(
-        title=settings.app_name,
+    application = FastAPI(
+        title=__app_name__,
         description=(
-            "Self-hosted Telegram automation, message forwarding "
-            "and workflow management platform."
+            "Self-hosted Telegram automation and message-forwarding platform."
         ),
-        version=settings.app_version,
-        debug=settings.debug,
-        lifespan=application_lifespan,
-        docs_url="/api/docs" if not settings.is_production else None,
-        redoc_url="/api/redoc" if not settings.is_production else None,
-        openapi_url="/api/openapi.json" if not settings.is_production else None,
+        version=__version__,
+        lifespan=lifespan or application_lifespan,
+        docs_url="/docs" if settings.environment != "production" else None,
+        redoc_url="/redoc" if settings.environment != "production" else None,
+        openapi_url=(
+            "/openapi.json"
+            if settings.environment != "production"
+            else None
+        ),
     )
 
-    # --------------------------------------------------------
-    # Application state
-    # --------------------------------------------------------
+    # Application state.
+    application.state.ready = False
+    application.state.settings = settings
+    application.state.limiter = limiter
 
-    app.state.ready = False
-    app.state.database_engine = None
-    app.state.database_session_factory = None
-
-    # --------------------------------------------------------
-    # Rate limiting
-    # --------------------------------------------------------
-
-    app.state.limiter = limiter
-
-    app.add_exception_handler(
+    # Exception handlers.
+    register_exception_handlers(application)
+    application.add_exception_handler(
         RateLimitExceeded,
-        lambda request, exc: __import__(
-            "fastapi.responses",
-            fromlist=["JSONResponse"],
-        ).JSONResponse(
-            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            content={
-                "success": False,
-                "message": "Too many requests. Please try again later.",
-                "error_code": "RATE_LIMIT_EXCEEDED",
-                "details": {},
-            },
-        ),
+        rate_limit_exception_handler,
     )
 
-    app.add_middleware(SlowAPIMiddleware)
+    # Request and security middleware.
+    application.add_middleware(SecurityHeadersMiddleware)
+    application.add_middleware(RequestLoggingMiddleware)
+    application.add_middleware(RequestContextMiddleware)
 
-    # --------------------------------------------------------
-    # Custom middleware
-    # --------------------------------------------------------
+    # CSRF protection is enabled for browser-facing requests.
+    # The middleware implementation must be compatible with
+    # the application's authentication/session implementation.
+    application.add_middleware(CSRFMiddleware)
 
-    for middleware_class, middleware_options in get_middleware_stack():
-        app.add_middleware(
-            middleware_class,
-            **middleware_options,
+    # Rate limiting.
+    application.add_middleware(SlowAPIMiddleware)
+
+    # Trusted host validation.
+    if settings.trusted_hosts:
+        application.add_middleware(
+            TrustedHostMiddleware,
+            allowed_hosts=settings.trusted_hosts,
         )
 
-    # --------------------------------------------------------
-    # Exception handlers
-    # --------------------------------------------------------
+    # Cross-origin access.
+    if settings.cors_origins:
+        application.add_middleware(
+            CORSMiddleware,
+            allow_origins=settings.cors_origins,
+            allow_credentials=True,
+            allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+            allow_headers=[
+                "Authorization",
+                "Content-Type",
+                "X-Request-ID",
+                "X-CSRF-Token",
+            ],
+        )
 
-    register_exception_handlers(app)
+    # Health endpoints.
+    @application.get(
+        "/health",
+        tags=["Health"],
+        summary="Application liveness",
+        include_in_schema=False,
+    )
+    async def health() -> dict[str, Any]:
+        """Lightweight liveness endpoint for container monitoring."""
+        return get_liveness_status()
 
-    # --------------------------------------------------------
-    # Routers
-    # --------------------------------------------------------
+    @application.get(
+        "/health/live",
+        tags=["Health"],
+        summary="Application liveness",
+    )
+    async def health_live() -> dict[str, Any]:
+        return get_liveness_status()
 
-    app.include_router(health_router)
+    @application.get(
+        "/health/ready",
+        tags=["Health"],
+        summary="Application readiness",
+    )
+    async def health_ready(request: Request) -> Response:
+        result = get_readiness_status(request)
 
-    # Versioned API router will be registered here when the
-    # API modules are implemented.
+        status_code = (
+            200 if result["status"] == "ready" else 503
+        )
 
-    return app
+        return JSONResponse(
+            status_code=status_code,
+            content=result,
+        )
 
+    @application.get(
+        "/health/details",
+        tags=["Health"],
+        summary="Detailed dependency health",
+    )
+    async def health_details() -> Response:
+        result = await get_detailed_health()
 
-# ============================================================
-# Application instance
-# ============================================================
+        status_code = (
+            200 if result["status"] == "healthy" else 503
+        )
 
-app = create_application()
+        return JSONResponse(
+            status_code=status_code,
+            content=result,
+        )
+
+    @application.get(
+        "/health/application",
+        tags=["Health"],
+        summary="Combined application health",
+        include_in_schema=False,
+    )
+    async def health_application(request: Request) -> Response:
+        result = await get_application_health(request)
+
+        status_code = (
+            200 if result["status"] == "healthy" else 503
+        )
+
+        return JSONResponse(
+            status_code=status_code,
+            content=result,
+        )
+
+    logger.info(
+        "TeleForward application instance created",
+        extra={
+            "environment": settings.environment,
+            "version": __version__,
+        },
+    )
+
+    return application
