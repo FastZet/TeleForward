@@ -2,238 +2,182 @@
 """
 TeleForward application lifecycle management.
 
-Handles:
-- Application logging configuration.
-- Persistent cryptographic secret bootstrapping.
-- Storage initialisation and validation.
-- Database initialisation and shutdown.
+Responsible for:
+- Application startup and shutdown.
+- Structured logging initialisation.
+- Persistent storage initialisation and validation.
+- Secure bootstrap of application secrets.
+- Database initialisation and disposal.
 - Application readiness management.
-- Graceful startup and shutdown.
+- Lifecycle event publication.
 """
 
-import json
 import logging
 import os
 import secrets
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import AsyncIterator
+from typing import Any, AsyncIterator
 
 from cryptography.fernet import Fernet
 from fastapi import FastAPI
 
 from app.core.config import get_settings
+from app.core.events import (
+    ApplicationEvent,
+    EventNames,
+    event_dispatcher,
+)
 from app.core.logging import configure_logging
-from app.core.paths import initialise_storage, validate_storage
+from app.core.paths import (
+    initialise_storage,
+    validate_storage,
+)
 from app.database.engine import get_database_engine
-from app.database.init import initialise_database, shutdown_database
+from app.database.init import (
+    initialise_database,
+    shutdown_database,
+)
 from app.database.session import get_session_factory
 
 
 logger = logging.getLogger(__name__)
 
-SECRET_FILE_NAME = ".teleforward-secrets.json"
 
-SECRET_KEYS = (
-    "secret_key",
-    "encryption_key",
-    "jwt_secret_key",
-)
-
-
-def _generate_bootstrap_secrets() -> dict[str, str]:
-    """Generate cryptographically secure application secrets."""
-    return {
-        "secret_key": secrets.token_urlsafe(48),
-        "encryption_key": Fernet.generate_key().decode("ascii"),
-        "jwt_secret_key": secrets.token_urlsafe(48),
-    }
+_SECRET_FILENAMES = {
+    "secret_key": "secret_key",
+    "encryption_key": "encryption_key",
+    "jwt_secret_key": "jwt_secret_key",
+}
 
 
-def _read_secret_file(path: Path) -> dict[str, str]:
-    """Read and validate the persistent secret file."""
-    try:
-        with path.open("r", encoding="utf-8") as file:
-            stored_secrets = json.load(file)
+def _generate_secret(setting_name: str) -> str:
+    """Generate a cryptographically secure secret."""
+    if setting_name == "encryption_key":
+        return Fernet.generate_key().decode("ascii")
 
-    except (OSError, json.JSONDecodeError) as exc:
-        raise RuntimeError(
-            "Unable to read the persistent application secrets file."
-        ) from exc
+    return secrets.token_urlsafe(64)
 
-    if not isinstance(stored_secrets, dict):
-        raise RuntimeError(
-            "The persistent application secrets file is invalid."
-        )
 
-    for key in SECRET_KEYS:
-        value = stored_secrets.get(key)
+def _read_or_create_secret(
+    directory: Path,
+    setting_name: str,
+    filename: str,
+) -> str:
+    """
+    Load an existing persistent secret or create one securely.
 
-        if not isinstance(value, str) or not value:
+    Files are created with restrictive permissions. Exclusive
+    creation prevents concurrent application instances from
+    overwriting an already-created secret.
+    """
+    secret_path = directory / filename
+
+    if secret_path.exists():
+        if not secret_path.is_file():
             raise RuntimeError(
-                f"The persistent secrets file is missing {key}."
+                f"Security secret path is not a regular file: {filename}"
             )
 
-    return stored_secrets
+        secret = secret_path.read_text(encoding="utf-8").strip()
 
-
-def _load_or_create_secret_file(data_dir: Path) -> dict[str, str]:
-    """
-    Load persistent secrets or create them on first startup.
-
-    The file is created atomically with restrictive permissions.
-    """
-    path = data_dir / SECRET_FILE_NAME
-
-    if path.exists():
-        if path.is_symlink() or not path.is_file():
+        if not secret:
             raise RuntimeError(
-                "The application secrets path is not a regular file."
+                f"Security secret file is empty: {filename}"
             )
 
-        if os.name == "posix":
-            permissions = path.stat().st_mode & 0o777
+        return secret
 
-            if permissions & 0o077:
-                raise RuntimeError(
-                    "Application secrets file permissions are too "
-                    "permissive. Set them to 600."
-                )
-
-        return _read_secret_file(path)
-
-    generated_secrets = _generate_bootstrap_secrets()
-
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
+    secret = _generate_secret(setting_name)
 
     try:
         file_descriptor = os.open(
-            path,
-            flags,
+            secret_path,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
             0o600,
         )
-
     except FileExistsError:
-        # Another process may have created the file concurrently.
-        return _read_secret_file(path)
+        # Another process created the secret concurrently.
+        return _read_or_create_secret(
+            directory,
+            setting_name,
+            filename,
+        )
 
     try:
         with os.fdopen(
             file_descriptor,
             "w",
             encoding="utf-8",
-        ) as file:
-            json.dump(
-                generated_secrets,
-                file,
-                indent=2,
-            )
-            file.write("\n")
-            file.flush()
-            os.fsync(file.fileno())
-
+        ) as secret_file:
+            secret_file.write(secret)
+            secret_file.write("\n")
+            secret_file.flush()
+            os.fsync(secret_file.fileno())
     except Exception:
-        try:
-            path.unlink(missing_ok=True)
-        except OSError:
-            logger.exception(
-                "Unable to remove an incomplete secrets file."
-            )
+        secret_path.unlink(missing_ok=True)
         raise
 
-    return generated_secrets
+    logger.info(
+        "Generated and persisted application security secret",
+        extra={"secret_type": setting_name},
+    )
+
+    return secret
 
 
 def initialise_application_secrets() -> None:
     """
-    Ensure that all cryptographic secrets are available.
+    Initialise all required application security secrets.
 
-    Explicit environment configuration takes precedence over
-    persistent bootstrap secrets.
+    Explicit environment configuration takes precedence.
+    Missing secrets are generated and persisted in the data
+    directory so that they remain stable across restarts.
     """
     settings = get_settings()
 
-    data_dir = Path(settings.data_dir)
-    stored_secrets = _load_or_create_secret_file(data_dir)
+    secrets_directory = Path(settings.data_dir) / "secrets"
+    secrets_directory.mkdir(
+        parents=True,
+        exist_ok=True,
+        mode=0o700,
+    )
 
-    for key in SECRET_KEYS:
-        configured_value = getattr(settings, key, None)
+    try:
+        secrets_directory.chmod(0o700)
+    except OSError:
+        logger.warning(
+            "Unable to enforce restrictive permissions on secrets directory"
+        )
 
-        if configured_value:
+    for setting_name, filename in _SECRET_FILENAMES.items():
+        configured_secret = getattr(settings, setting_name, None)
+
+        if configured_secret:
             continue
 
-        setattr(
-            settings,
-            key,
-            stored_secrets[key],
+        generated_secret = _read_or_create_secret(
+            directory=secrets_directory,
+            setting_name=setting_name,
+            filename=filename,
         )
 
-    logger.info(
-        "Application cryptographic secrets are available."
-    )
+        # Pydantic Settings instances are mutable by default.
+        # Keep the resolved value available to application services.
+        setattr(settings, setting_name, generated_secret)
 
 
-async def _shutdown_services(app: FastAPI) -> None:
-    """
-    Stop application services in dependency-safe order.
-
-    Additional Telegram, scheduler and worker shutdown operations
-    will be registered here as those services are implemented.
-    """
-    shutdown_errors: list[str] = []
-
-    # Stop background workers before disposing database resources.
-    workers = getattr(app.state, "workers", [])
-
-    for worker in reversed(workers):
-        try:
-            await worker.stop()
-        except Exception:
-            logger.exception("Unable to stop a background worker.")
-            shutdown_errors.append("background worker")
-
-    # Stop the scheduler if it has been initialised.
-    scheduler = getattr(app.state, "scheduler", None)
-
-    if scheduler is not None:
-        try:
-            await scheduler.shutdown()
-        except Exception:
-            logger.exception("Unable to shut down the scheduler.")
-            shutdown_errors.append("scheduler")
-
-    # Disconnect Telegram clients.
-    telegram_manager = getattr(
-        app.state,
-        "telegram_manager",
-        None,
-    )
-
-    if telegram_manager is not None:
-        try:
-            await telegram_manager.disconnect_all()
-        except Exception:
-            logger.exception(
-                "Unable to disconnect Telegram clients."
-            )
-            shutdown_errors.append("Telegram clients")
-
-    # Database resources must remain available until dependent
-    # workers and services have stopped.
-    try:
-        await shutdown_database()
-    except Exception:
-        logger.exception("Unable to shut down the database.")
-        shutdown_errors.append("database")
-
-    if shutdown_errors:
-        logger.error(
-            "Application shutdown completed with errors: %s",
-            ", ".join(shutdown_errors),
+async def _publish_event(
+    event_name: EventNames,
+    data: dict[str, Any] | None = None,
+) -> None:
+    """Publish an application lifecycle event."""
+    await event_dispatcher.publish(
+        ApplicationEvent(
+            name=event_name,
+            data=data or {},
         )
+    )
 
 
 @asynccontextmanager
@@ -241,78 +185,89 @@ async def application_lifespan(
     app: FastAPI,
 ) -> AsyncIterator[None]:
     """
-    Manage application startup and shutdown.
+    Manage the complete FastAPI application lifecycle.
 
-    The application becomes ready only after configuration,
-    storage and database initialisation have succeeded.
+    Readiness is enabled only after all mandatory startup
+    operations have completed successfully.
     """
-    settings = get_settings()
-
     app.state.ready = False
 
-    configure_logging(settings)
-
-    logger.info(
-        "Starting %s in %s mode.",
-        "TeleForward",
-        settings.environment,
-    )
+    database_initialised = False
 
     try:
-        # Initialise persistent storage directories.
-        initialise_storage()
-        validate_storage()
+        # Load application configuration.
+        settings = get_settings()
 
-        # Generate or load secrets after the data directory exists.
+        # Initialise structured logging before other startup work.
+        configure_logging(settings)
+
+        logger.info("Starting TeleForward")
+
+        # Prepare persistent storage.
+        storage_paths = initialise_storage()
+        validate_storage(storage_paths)
+
+        app.state.storage_paths = storage_paths
+
+        # Generate or load persistent security secrets.
         initialise_application_secrets()
 
-        # Initialise the database and apply pending Alembic migrations.
-        await initialise_database(
-            apply_migrations=True,
-            create_schema=False,
-        )
+        # Initialise database connectivity and migrations.
+        await initialise_database()
+        database_initialised = True
 
         # Expose database resources to application dependencies.
         app.state.database_engine = get_database_engine()
         app.state.database_session_factory = get_session_factory()
 
-        # Initialise service registries for later integration.
-        if not hasattr(app.state, "workers"):
-            app.state.workers = []
-
-        app.state.scheduler = getattr(
-            app.state,
-            "scheduler",
-            None,
+        # Notify application event subscribers.
+        await _publish_event(
+            EventNames.APPLICATION_STARTED,
+            {
+                "application": "TeleForward",
+                "version": "0.1.0",
+            },
         )
 
-        app.state.telegram_manager = getattr(
-            app.state,
-            "telegram_manager",
-            None,
-        )
-
-        # All mandatory startup operations have succeeded.
+        # Application is ready only after mandatory startup succeeds.
         app.state.ready = True
 
-        logger.info("TeleForward startup completed successfully.")
+        logger.info("TeleForward startup completed successfully")
 
         yield
 
     except Exception:
         app.state.ready = False
-        logger.exception("TeleForward startup failed.")
 
-        # Clean up partially initialised resources.
-        await _shutdown_services(app)
+        logger.exception("TeleForward startup or runtime lifecycle failed")
+
         raise
 
     finally:
-        # Readiness must be withdrawn before shutdown begins.
+        # Prevent new requests from being treated as ready.
         app.state.ready = False
 
-        logger.info("TeleForward is shutting down.")
+        logger.info("Stopping TeleForward")
 
-        await _shutdown_services(app)
+        try:
+            await _publish_event(
+                EventNames.APPLICATION_STOPPING,
+                {"application": "TeleForward"},
+            )
+        except Exception:
+            logger.exception(
+                "Failed to publish application shutdown event"
+            )
 
-        logger.info("TeleForward shutdown completed.")
+        if database_initialised:
+            try:
+                await shutdown_database()
+            except Exception:
+                logger.exception(
+                    "Database shutdown encountered an error"
+                )
+
+        app.state.database_engine = None
+        app.state.database_session_factory = None
+
+        logger.info("TeleForward shutdown completed")
