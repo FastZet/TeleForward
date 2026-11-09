@@ -1,12 +1,11 @@
 
 """
-TeleForward backend entry point.
+TeleForward application entry point.
 
-Exports the FastAPI application instance for Uvicorn.
+Uvicorn imports the application instance from this module.
 """
 
 from app.core.application import create_application
 
 
-# Main ASGI application instance.
 app = create_application()
