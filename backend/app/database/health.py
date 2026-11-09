@@ -2,83 +2,112 @@
 """
 TeleForward database health diagnostics.
 
-Provides database connectivity checks, dialect identification
-and connection latency measurements.
+Provides connection checks, latency measurements and safe
+database metadata for application health monitoring.
 """
 
+import logging
 import time
 from typing import Any
 
-import structlog
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 
 from app.database.engine import get_database_engine
 
 
-logger = structlog.get_logger(__name__)
+logger = logging.getLogger(__name__)
 
 
 async def check_database_connection() -> dict[str, Any]:
     """
-    Check database connectivity and measure response time.
+    Check database connectivity and measure response latency.
 
-    Returns:
-        Dictionary containing database health information.
+    Returns a structured health result without exposing
+    connection strings or credentials.
     """
-    engine = get_database_engine()
-
-    start_time = time.perf_counter()
+    started_at = time.perf_counter()
 
     try:
+        engine = get_database_engine()
+
         async with engine.connect() as connection:
             await connection.execute(text("SELECT 1"))
 
         latency_ms = round(
-            (time.perf_counter() - start_time) * 1000,
+            (time.perf_counter() - started_at) * 1000,
             2,
         )
 
         return {
             "status": "healthy",
-            "dialect": engine.dialect.name,
             "latency_ms": latency_ms,
+            "database": engine.dialect.name,
+            "driver": engine.dialect.driver,
         }
 
     except SQLAlchemyError:
-        logger.exception("database_connection_health_check_failed")
+        logger.exception("Database health check failed.")
 
         return {
             "status": "unhealthy",
-            "dialect": engine.dialect.name,
+            "latency_ms": None,
+            "database": None,
+            "driver": None,
+            "error": "Database connection or query failed.",
+        }
+
+    except Exception:
+        logger.exception(
+            "Unexpected error during database health check."
+        )
+
+        return {
+            "status": "unhealthy",
+            "latency_ms": None,
+            "database": None,
+            "driver": None,
+            "error": "Database health check could not be completed.",
         }
 
 
 async def get_database_diagnostics() -> dict[str, Any]:
     """
-    Return detailed database diagnostics.
+    Return safe database diagnostics.
 
-    Provides operational information without exposing
-    connection strings, credentials or sensitive data.
+    Includes dialect and driver information without returning
+    database URLs, usernames, passwords or filesystem paths.
     """
-    engine = get_database_engine()
+    try:
+        engine = get_database_engine()
 
-    health = await check_database_connection()
+        return {
+            "configured": True,
+            "dialect": engine.dialect.name,
+            "driver": engine.dialect.driver,
+            "pool": type(engine.pool).__name__,
+            "pool_size": (
+                engine.pool.size()
+                if hasattr(engine.pool, "size")
+                else None
+            ),
+            "checked_out_connections": (
+                engine.pool.checkedout()
+                if hasattr(engine.pool, "checkedout")
+                else None
+            ),
+        }
 
-    result = {
-        "status": health["status"],
-        "dialect": health["dialect"],
-        "driver": engine.dialect.driver,
-    }
+    except Exception:
+        logger.exception(
+            "Unable to retrieve database diagnostics."
+        )
 
-    if "latency_ms" in health:
-        result["latency_ms"] = health["latency_ms"]
-
-    if engine.dialect.name == "sqlite":
-        result["database_type"] = "SQLite"
-    elif engine.dialect.name == "postgresql":
-        result["database_type"] = "PostgreSQL"
-    else:
-        result["database_type"] = "Other"
-
-    return result
+        return {
+            "configured": False,
+            "dialect": None,
+            "driver": None,
+            "pool": None,
+            "pool_size": None,
+            "checked_out_connections": None,
+        }
