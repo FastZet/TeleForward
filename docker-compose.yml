@@ -1,0 +1,60 @@
+
+name: teleforward
+
+services:
+  teleforward:
+    container_name: teleforward
+
+    build:
+      context: .
+      dockerfile: Dockerfile
+
+    restart: unless-stopped
+
+    init: true
+    stop_grace_period: 30s
+
+    ports:
+      - "${TELEFORWARD_BIND_ADDRESS:-127.0.0.1}:${TELEFORWARD_PORT:-8000}:8000"
+
+    environment:
+      TELEFORWARD_ENV: production
+      TELEFORWARD_HOST: 0.0.0.0
+      TELEFORWARD_PORT: 8000
+      TELEFORWARD_DATA_DIR: /app/data
+      TELEFORWARD_TIMEZONE: ${TELEFORWARD_TIMEZONE:-Asia/Kolkata}
+      PYTHONUNBUFFERED: "1"
+      PYTHONDONTWRITEBYTECODE: "1"
+
+    volumes:
+      - teleforward_data:/app/data
+
+    security_opt:
+      - no-new-privileges:true
+
+    cap_drop:
+      - ALL
+
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=5)"
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  teleforward_data:
+    name: teleforward_data
