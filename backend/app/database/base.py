@@ -1,20 +1,27 @@
 
 """
-TeleForward SQLAlchemy declarative base.
+TeleForward SQLAlchemy declarative base and reusable mixins.
 
-Defines shared ORM conventions and the declarative base
-used by all application database models.
+Provides:
+- DeclarativeBase with consistent metadata naming conventions.
+- Integer primary-key mixin.
+- UTC timestamp mixin.
 """
 
-from datetime import UTC, datetime
+from datetime import datetime, timezone
+from typing import Annotated
 
-from sqlalchemy import DateTime, MetaData, func
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+from sqlalchemy import (
+    DateTime,
+    MetaData,
+    func,
+)
+from sqlalchemy.orm import (
+    DeclarativeBase,
+    Mapped,
+    mapped_column,
+)
 
-
-# ============================================================
-# Database naming conventions
-# ============================================================
 
 NAMING_CONVENTION = {
     "ix": "ix_%(column_0_label)s",
@@ -28,41 +35,29 @@ NAMING_CONVENTION = {
 }
 
 
-metadata = MetaData(
-    naming_convention=NAMING_CONVENTION,
-)
-
-
-# ============================================================
-# Declarative base
-# ============================================================
-
 class Base(DeclarativeBase):
-    """
-    Common declarative base for TeleForward ORM models.
+    """Base class for all TeleForward ORM models."""
 
-    All database models should inherit from this class.
-    """
-
-    metadata = metadata
+    metadata = MetaData(
+        naming_convention=NAMING_CONVENTION,
+    )
 
 
-# ============================================================
-# Common timestamp mixin
-# ============================================================
+class PrimaryKeyMixin:
+    """Reusable auto-incrementing integer primary key."""
+
+    id: Mapped[int] = mapped_column(
+        primary_key=True,
+        autoincrement=True,
+    )
+
 
 class TimestampMixin:
     """
-    Provides standard creation and update timestamps.
+    Reusable creation and modification timestamps.
 
-    Timestamps are stored in UTC.
-
-    created_at:
-        Set automatically when the record is inserted.
-
-    updated_at:
-        Set automatically when the record is inserted
-        and whenever the record is updated.
+    Database-side defaults provide timestamps even when records
+    are inserted outside normal ORM application workflows.
     """
 
     created_at: Mapped[datetime] = mapped_column(
@@ -76,22 +71,4 @@ class TimestampMixin:
         nullable=False,
         server_default=func.now(),
         onupdate=func.now(),
-    )
-
-
-# ============================================================
-# Common primary key mixin
-# ============================================================
-
-class PrimaryKeyMixin:
-    """
-    Provides an auto-incrementing integer primary key.
-
-    Models can inherit this mixin when integer identifiers
-    are appropriate for their database representation.
-    """
-
-    id: Mapped[int] = mapped_column(
-        primary_key=True,
-        autoincrement=True,
     )
