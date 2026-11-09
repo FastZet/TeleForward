@@ -1,14 +1,18 @@
 
 """
-TeleForward asynchronous database engine.
+TeleForward asynchronous database engine configuration.
 
-Configures SQLAlchemy 2.x asynchronous database connectivity
-for SQLite and PostgreSQL.
+Supports:
+- SQLite through aiosqlite.
+- PostgreSQL through asyncpg.
+
+Provides connection pooling, SQLite integrity settings and
+centralised engine lifecycle management.
 """
 
 from functools import lru_cache
-from typing import Any
 
+from sqlalchemy import event
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     create_async_engine,
@@ -18,73 +22,86 @@ from app.core.config import get_settings
 from app.core.exceptions import ConfigurationError
 
 
-def _get_engine_options(database_url: str) -> dict[str, Any]:
+def _configure_sqlite_engine(engine: AsyncEngine) -> None:
     """
-    Return database-specific SQLAlchemy engine options.
+    Configure SQLite connection-level settings.
 
-    SQLite:
-        Enables foreign key enforcement and configures a
-        connection timeout.
-
-    PostgreSQL:
-        Configures connection pooling.
+    SQLite foreign-key enforcement is disabled by default.
+    Enable it on every new connection.
     """
-    if database_url.startswith("sqlite+aiosqlite://"):
-        return {
-            "echo": False,
-            "connect_args": {
-                "timeout": 30,
-            },
-        }
 
-    if database_url.startswith("postgresql+asyncpg://"):
-        return {
-            "echo": False,
-            "pool_size": 5,
-            "max_overflow": 10,
-            "pool_timeout": 30,
-            "pool_recycle": 1800,
-            "pool_pre_ping": True,
-        }
+    @event.listens_for(engine.sync_engine, "connect")
+    def set_sqlite_pragmas(
+        dbapi_connection,
+        connection_record,
+    ) -> None:
+        """Apply SQLite PRAGMA settings to each connection."""
+        cursor = dbapi_connection.cursor()
 
-    raise ConfigurationError(
-        "Unsupported database URL. Use SQLite or PostgreSQL "
-        "with an asynchronous SQLAlchemy driver."
-    )
+        try:
+            cursor.execute("PRAGMA foreign_keys=ON")
+            cursor.execute("PRAGMA busy_timeout=30000")
+        finally:
+            cursor.close()
 
 
 @lru_cache(maxsize=1)
 def get_database_engine() -> AsyncEngine:
     """
-    Create and return the cached asynchronous database engine.
+    Return the cached asynchronous SQLAlchemy engine.
 
-    Returns:
-        SQLAlchemy AsyncEngine.
-
-    Raises:
-        ConfigurationError: If the database URL is unsupported.
+    The database URL is obtained from application settings.
+    Unsupported database drivers raise ConfigurationError.
     """
     settings = get_settings()
     database_url = settings.effective_database_url
 
-    options = _get_engine_options(database_url)
+    if not database_url:
+        raise ConfigurationError(
+            "A database connection URL must be configured."
+        )
 
-    return create_async_engine(
-        database_url,
-        **options,
+    common_options = {
+        "echo": False,
+        "pool_pre_ping": True,
+    }
+
+    if database_url.startswith("sqlite+aiosqlite://"):
+        engine = create_async_engine(
+            database_url,
+            connect_args={
+                "timeout": 30,
+            },
+            **common_options,
+        )
+
+        _configure_sqlite_engine(engine)
+
+        return engine
+
+    if database_url.startswith("postgresql+asyncpg://"):
+        return create_async_engine(
+            database_url,
+            pool_size=10,
+            max_overflow=20,
+            pool_timeout=30,
+            pool_recycle=1800,
+            **common_options,
+        )
+
+    raise ConfigurationError(
+        "Unsupported database URL. "
+        "Supported drivers are sqlite+aiosqlite and "
+        "postgresql+asyncpg."
     )
 
 
 async def dispose_database_engine() -> None:
     """
-    Dispose of the cached database engine.
+    Dispose the cached database engine.
 
-    Should be called during application shutdown to release
-    database connections cleanly.
+    This closes pooled connections during application shutdown.
     """
-    if get_database_engine.cache_info().currsize == 0:
-        return
-
     engine = get_database_engine()
 
     await engine.dispose()
