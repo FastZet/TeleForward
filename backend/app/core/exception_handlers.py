@@ -1,268 +1,247 @@
 
 """
-TeleForward centralised exception handlers.
+TeleForward global exception handlers.
 
-Converts application exceptions, HTTP errors, validation failures
-and unexpected exceptions into consistent API error responses.
+Provides consistent HTTP error responses, application exception
+mapping, request validation handling, and safe unexpected error
+handling.
 """
 
-from collections.abc import Callable
+import logging
+from http import HTTPStatus
+from typing import Any
 
-import structlog
-from fastapi import FastAPI, Request, status
+from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from app.core.exceptions import (
-    AuthenticationError,
-    AuthorizationError,
-    ConfigurationError,
-    DatabaseError,
-    DuplicateMessageError,
-    ForwardingError,
-    RateLimitExceededError,
-    ResourceConflictError,
-    ResourceNotFoundError,
-    RestoreError,
-    SchedulingError,
-    StorageError,
-    TeleForwardError,
-    TelegramError,
-    ValidationError,
-)
+from app.core.exceptions import TeleForwardError
 from app.core.responses import error_response
 
 
-logger = structlog.get_logger(__name__)
+logger = logging.getLogger(__name__)
 
 
-# ============================================================
-# Exception-to-HTTP status mapping
-# ============================================================
-
-EXCEPTION_STATUS_CODES: dict[type[Exception], int] = {
-    AuthenticationError: status.HTTP_401_UNAUTHORIZED,
-    AuthorizationError: status.HTTP_403_FORBIDDEN,
-    ValidationError: status.HTTP_422_UNPROCESSABLE_ENTITY,
-    ResourceNotFoundError: status.HTTP_404_NOT_FOUND,
-    ResourceConflictError: status.HTTP_409_CONFLICT,
-    DuplicateMessageError: status.HTTP_409_CONFLICT,
-    RateLimitExceededError: status.HTTP_429_TOO_MANY_REQUESTS,
-    ConfigurationError: status.HTTP_500_INTERNAL_SERVER_ERROR,
-    DatabaseError: status.HTTP_500_INTERNAL_SERVER_ERROR,
-    StorageError: status.HTTP_500_INTERNAL_SERVER_ERROR,
-    ForwardingError: status.HTTP_502_BAD_GATEWAY,
-    TelegramError: status.HTTP_502_BAD_GATEWAY,
-    SchedulingError: status.HTTP_500_INTERNAL_SERVER_ERROR,
-    RestoreError: status.HTTP_500_INTERNAL_SERVER_ERROR,
+APPLICATION_EXCEPTION_STATUS_CODES: dict[str, int] = {
+    "ConfigurationError": 500,
+    "DatabaseError": 503,
+    "StorageError": 503,
+    "AuthenticationError": 401,
+    "AuthorizationError": 403,
+    "SessionError": 401,
+    "ValidationError": 422,
+    "NotFoundError": 404,
+    "ConflictError": 409,
+    "RateLimitError": 429,
+    "TelegramError": 502,
+    "TelegramFloodWaitError": 429,
+    "TelegramAccountError": 400,
+    "ForwardingError": 422,
+    "FilterError": 422,
+    "TransformationError": 422,
+    "DuplicateMessageError": 409,
+    "SchedulingError": 422,
+    "WorkerError": 503,
+    "QueueError": 503,
+    "BackupError": 500,
+    "RestoreError": 500,
 }
 
 
-def get_exception_status_code(
-    exception: TeleForwardError,
-) -> int:
-    """Resolve the HTTP status code for an application exception."""
-    for exception_type in type(exception).__mro__:
-        if exception_type in EXCEPTION_STATUS_CODES:
-            return EXCEPTION_STATUS_CODES[exception_type]
-
-    return status.HTTP_500_INTERNAL_SERVER_ERROR
-
-
-def get_request_id(request: Request) -> str | None:
-    """Retrieve the request correlation ID, if available."""
-    return getattr(request.state, "request_id", None)
+def _request_metadata(request: Request) -> dict[str, Any]:
+    """Return safe request metadata for structured logging."""
+    return {
+        "method": request.method,
+        "path": request.url.path,
+        "request_id": getattr(
+            request.state,
+            "request_id",
+            None,
+        ),
+    }
 
 
-def create_error_response(
-    *,
-    message: str,
-    error_code: str,
-    status_code: int,
-    request_id: str | None = None,
-    details: dict | None = None,
-    headers: dict[str, str] | None = None,
+def _error_code_from_status(status_code: int) -> str:
+    """Convert an HTTP status code into a stable error identifier."""
+    try:
+        phrase = HTTPStatus(status_code).phrase
+    except ValueError:
+        phrase = "HTTP Error"
+
+    return (
+        phrase.upper()
+        .replace(" ", "_")
+        .replace("-", "_")
+    )
+
+
+async def application_exception_handler(
+    request: Request,
+    exc: TeleForwardError,
 ) -> JSONResponse:
-    """Build a consistent JSON error response."""
-    response_details = details or {}
+    """Handle TeleForward application exceptions."""
+    exception_name = type(exc).__name__
 
-    if request_id:
-        response_details["request_id"] = request_id
+    status_code = APPLICATION_EXCEPTION_STATUS_CODES.get(
+        exception_name,
+        500,
+    )
+
+    if status_code >= 500:
+        logger.error(
+            "Application exception",
+            extra={
+                **_request_metadata(request),
+                "exception_type": exception_name,
+            },
+            exc_info=exc,
+        )
+    else:
+        logger.warning(
+            "Application exception",
+            extra={
+                **_request_metadata(request),
+                "exception_type": exception_name,
+            },
+        )
+
+    message = (
+        str(exc)
+        if status_code < 500
+        else "An internal application error occurred."
+    )
 
     return JSONResponse(
         status_code=status_code,
         content=error_response(
+            code=exception_name.upper(),
             message=message,
-            error_code=error_code,
-            details=response_details,
         ).model_dump(mode="json"),
-        headers=headers,
     )
 
-
-# ============================================================
-# Application exception handler
-# ============================================================
-
-async def teleforward_exception_handler(
-    request: Request,
-    exception: TeleForwardError,
-) -> JSONResponse:
-    """Handle exceptions raised by TeleForward application services."""
-    status_code = get_exception_status_code(exception)
-    request_id = get_request_id(request)
-
-    if status_code >= 500:
-        logger.error(
-            "application_exception",
-            exception_type=type(exception).__name__,
-            message=exception.message,
-            request_id=request_id,
-            path=request.url.path,
-        )
-    else:
-        logger.warning(
-            "application_exception",
-            exception_type=type(exception).__name__,
-            message=exception.message,
-            request_id=request_id,
-            path=request.url.path,
-        )
-
-    # Internal exception details are deliberately not exposed
-    # to clients. Future endpoints can provide explicitly
-    # sanitised, user-facing details where appropriate.
-    return create_error_response(
-        message=(
-            exception.message
-            if status_code < 500
-            else "An internal application error occurred."
-        ),
-        error_code=type(exception).__name__.upper(),
-        status_code=status_code,
-        request_id=request_id,
-    )
-
-
-# ============================================================
-# HTTP exception handler
-# ============================================================
 
 async def http_exception_handler(
     request: Request,
-    exception: StarletteHTTPException,
+    exc: StarletteHTTPException,
 ) -> JSONResponse:
-    """Convert framework HTTP exceptions into standard responses."""
-    detail = exception.detail
+    """Handle HTTP exceptions using the standard error envelope."""
+    detail = exc.detail
 
-    message = (
-        detail
-        if isinstance(detail, str)
-        else "The request could not be completed."
+    if isinstance(detail, dict):
+        code = str(
+            detail.get("code")
+            or _error_code_from_status(exc.status_code)
+        )
+
+        message = str(
+            detail.get("message")
+            or "The request could not be completed."
+        )
+
+        details = detail.get("details")
+
+    else:
+        code = _error_code_from_status(exc.status_code)
+        message = (
+            str(detail)
+            if isinstance(detail, str)
+            else "The request could not be completed."
+        )
+        details = None
+
+    return JSONResponse(
+        status_code=exc.status_code,
+        content=error_response(
+            code=code,
+            message=message,
+            details=details,
+        ).model_dump(mode="json"),
+        headers=exc.headers,
     )
 
-    return create_error_response(
-        message=message,
-        error_code=f"HTTP_{exception.status_code}",
-        status_code=exception.status_code,
-        request_id=get_request_id(request),
-        headers=exception.headers,
-    )
-
-
-# ============================================================
-# Request validation handler
-# ============================================================
 
 async def request_validation_exception_handler(
     request: Request,
-    exception: RequestValidationError,
+    exc: RequestValidationError,
 ) -> JSONResponse:
     """
-    Handle invalid request payloads and parameters.
+    Handle request validation failures.
 
-    Only validation locations, messages and error types are
-    returned. Submitted values are never included in responses.
+    Sensitive input values are deliberately excluded from
+    the response.
     """
-    validation_errors = [
-        {
-            "location": list(error.get("loc", ())),
-            "message": error.get("msg", "Invalid value."),
-            "type": error.get("type", "validation_error"),
-        }
-        for error in exception.errors()
-    ]
+    validation_errors = []
 
-    return create_error_response(
-        message="Request validation failed.",
-        error_code="REQUEST_VALIDATION_ERROR",
-        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-        request_id=get_request_id(request),
-        details={
-            "errors": validation_errors,
+    for error in exc.errors():
+        validation_errors.append({
+            "location": [
+                str(part)
+                for part in error.get("loc", ())
+            ],
+            "message": error.get("msg", "Invalid input."),
+            "type": error.get("type", "validation_error"),
+        })
+
+    logger.warning(
+        "Request validation failed",
+        extra={
+            **_request_metadata(request),
+            "validation_error_count": len(validation_errors),
         },
     )
 
+    return JSONResponse(
+        status_code=422,
+        content=error_response(
+            code="REQUEST_VALIDATION_FAILED",
+            message="One or more request fields are invalid.",
+            details=validation_errors,
+        ).model_dump(mode="json"),
+    )
 
-# ============================================================
-# Unexpected exception handler
-# ============================================================
 
 async def unexpected_exception_handler(
     request: Request,
-    exception: Exception,
+    exc: Exception,
 ) -> JSONResponse:
-    """
-    Handle unexpected application failures.
-
-    Full exception information is logged internally, while
-    clients receive a generic error message.
-    """
-    request_id = get_request_id(request)
-
+    """Handle unexpected exceptions without exposing internals."""
     logger.exception(
-        "unhandled_exception",
-        exception_type=type(exception).__name__,
-        request_id=request_id,
-        path=request.url.path,
-        method=request.method,
+        "Unhandled application exception",
+        extra=_request_metadata(request),
     )
 
-    return create_error_response(
-        message="An unexpected internal server error occurred.",
-        error_code="INTERNAL_SERVER_ERROR",
-        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-        request_id=request_id,
+    return JSONResponse(
+        status_code=500,
+        content=error_response(
+            code="INTERNAL_SERVER_ERROR",
+            message="An unexpected internal error occurred.",
+        ).model_dump(mode="json"),
     )
 
 
-# ============================================================
-# FastAPI registration
-# ============================================================
-
-def register_exception_handlers(app: FastAPI) -> None:
-    """
-    Register all centralised exception handlers.
-
-    Call this function when constructing the FastAPI application.
-    """
-    app.add_exception_handler(
+def register_exception_handlers(
+    application: FastAPI,
+) -> None:
+    """Register all global application exception handlers."""
+    application.add_exception_handler(
         TeleForwardError,
-        teleforward_exception_handler,
+        application_exception_handler,
     )
 
-    app.add_exception_handler(
+    application.add_exception_handler(
         StarletteHTTPException,
         http_exception_handler,
     )
 
-    app.add_exception_handler(
+    application.add_exception_handler(
         RequestValidationError,
         request_validation_exception_handler,
     )
 
-    app.add_exception_handler(
+    application.add_exception_handler(
         Exception,
         unexpected_exception_handler,
     )
+
+    logger.debug("Global exception handlers registered")
