@@ -1,13 +1,16 @@
 
 """
-TeleForward database health diagnostics.
+TeleForward database health monitoring and diagnostics.
 
-Provides connection checks, latency measurements and safe
-database metadata for application health monitoring.
+Provides:
+- Database connectivity checks.
+- Connection latency measurement.
+- Database dialect and driver information.
+- Safe connection-pool diagnostics.
 """
 
-import logging
-import time
+from datetime import datetime, timezone
+from time import perf_counter
 from typing import Any
 
 from sqlalchemy import text
@@ -16,17 +19,15 @@ from sqlalchemy.exc import SQLAlchemyError
 from app.database.engine import get_database_engine
 
 
-logger = logging.getLogger(__name__)
-
-
 async def check_database_connection() -> dict[str, Any]:
     """
     Check database connectivity and measure response latency.
 
-    Returns a structured health result without exposing
-    connection strings or credentials.
+    Returns a structured result suitable for health endpoints.
+    Does not expose connection strings or credentials.
     """
-    started_at = time.perf_counter()
+
+    started_at = perf_counter()
 
     try:
         engine = get_database_engine()
@@ -35,79 +36,74 @@ async def check_database_connection() -> dict[str, Any]:
             await connection.execute(text("SELECT 1"))
 
         latency_ms = round(
-            (time.perf_counter() - started_at) * 1000,
+            (perf_counter() - started_at) * 1000,
             2,
         )
 
         return {
             "status": "healthy",
+            "connected": True,
             "latency_ms": latency_ms,
-            "database": engine.dialect.name,
-            "driver": engine.dialect.driver,
-        }
-
-    except SQLAlchemyError:
-        logger.exception("Database health check failed.")
-
-        return {
-            "status": "unhealthy",
-            "latency_ms": None,
-            "database": None,
-            "driver": None,
-            "error": "Database connection or query failed.",
-        }
-
-    except Exception:
-        logger.exception(
-            "Unexpected error during database health check."
-        )
-
-        return {
-            "status": "unhealthy",
-            "latency_ms": None,
-            "database": None,
-            "driver": None,
-            "error": "Database health check could not be completed.",
-        }
-
-
-async def get_database_diagnostics() -> dict[str, Any]:
-    """
-    Return safe database diagnostics.
-
-    Includes dialect and driver information without returning
-    database URLs, usernames, passwords or filesystem paths.
-    """
-    try:
-        engine = get_database_engine()
-
-        return {
-            "configured": True,
             "dialect": engine.dialect.name,
             "driver": engine.dialect.driver,
-            "pool": type(engine.pool).__name__,
-            "pool_size": (
-                engine.pool.size()
-                if hasattr(engine.pool, "size")
-                else None
-            ),
-            "checked_out_connections": (
-                engine.pool.checkedout()
-                if hasattr(engine.pool, "checkedout")
-                else None
-            ),
+            "checked_at": datetime.now(timezone.utc).isoformat(),
         }
 
-    except Exception:
-        logger.exception(
-            "Unable to retrieve database diagnostics."
-        )
-
+    except SQLAlchemyError as exc:
         return {
-            "configured": False,
-            "dialect": None,
-            "driver": None,
-            "pool": None,
-            "pool_size": None,
-            "checked_out_connections": None,
+            "status": "unhealthy",
+            "connected": False,
+            "error": type(exc).__name__,
+            "checked_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+    except Exception as exc:
+        return {
+            "status": "unhealthy",
+            "connected": False,
+            "error": type(exc).__name__,
+            "checked_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+
+def get_database_diagnostics() -> dict[str, Any]:
+    """
+    Return safe database engine and connection-pool diagnostics.
+
+    Pool statistics are operational metadata only. No credentials,
+    database URLs, or SQL statements are exposed.
+    """
+
+    try:
+        engine = get_database_engine()
+        pool = engine.pool
+
+        diagnostics: dict[str, Any] = {
+            "dialect": engine.dialect.name,
+            "driver": engine.dialect.driver,
+            "pool_class": type(pool).__name__,
+        }
+
+        pool_methods = {
+            "pool_size": "size",
+            "checked_in_connections": "checkedin",
+            "checked_out_connections": "checkedout",
+            "overflow_connections": "overflow",
+        }
+
+        for output_key, method_name in pool_methods.items():
+            method = getattr(pool, method_name, None)
+
+            if callable(method):
+                try:
+                    diagnostics[output_key] = method()
+                except Exception:
+                    diagnostics[output_key] = None
+
+        return diagnostics
+
+    except Exception as exc:
+        return {
+            "status": "unavailable",
+            "error": type(exc).__name__,
         }
