@@ -3,14 +3,13 @@
 TeleForward asynchronous database session management.
 
 Provides:
-- Cached asynchronous session factory.
+- A cached asynchronous session factory.
 - Request-scoped database sessions.
-- Explicit transaction management.
-- Safe session cleanup.
+- Explicit transaction-scoped sessions.
+- Session-factory cache cleanup.
 """
 
-from collections.abc import AsyncGenerator, AsyncIterator
-from contextlib import asynccontextmanager
+from collections.abc import AsyncIterator
 from functools import lru_cache
 
 from sqlalchemy.ext.asyncio import (
@@ -18,7 +17,6 @@ from sqlalchemy.ext.asyncio import (
     async_sessionmaker,
 )
 
-from app.core.exceptions import DatabaseError
 from app.database.engine import get_database_engine
 
 
@@ -27,74 +25,67 @@ def get_session_factory() -> async_sessionmaker[AsyncSession]:
     """
     Return the cached asynchronous SQLAlchemy session factory.
 
-    Sessions use explicit transaction management and do not
-    expire ORM objects automatically after commit.
+    Sessions do not expire ORM objects automatically after commit,
+    allowing services to access committed object attributes without
+    requiring an immediate database refresh.
     """
-    engine = get_database_engine()
 
     return async_sessionmaker(
-        bind=engine,
+        bind=get_database_engine(),
         class_=AsyncSession,
-        autoflush=False,
+        autoflush=True,
         expire_on_commit=False,
-        autocommit=False,
     )
 
 
-async def get_session() -> AsyncGenerator[AsyncSession, None]:
+async def get_session() -> AsyncIterator[AsyncSession]:
     """
-    Provide a database session for FastAPI dependency injection.
+    Provide a database session without automatic commit.
 
-    The session is always closed after the request completes.
-    This dependency does not automatically commit transactions.
+    Intended for FastAPI dependency injection.
+
+    Transaction commits must be performed explicitly by the
+    application service. Any unfinished transaction is rolled
+    back when the session scope ends.
     """
+
     session_factory = get_session_factory()
 
     async with session_factory() as session:
         try:
             yield session
-
-        except Exception:
-            await session.rollback()
+        except BaseException:
+            if session.in_transaction():
+                await session.rollback()
             raise
-
         finally:
-            await session.close()
+            if session.in_transaction():
+                await session.rollback()
 
 
-@asynccontextmanager
 async def get_transaction() -> AsyncIterator[AsyncSession]:
     """
     Provide a session with an automatically managed transaction.
 
-    Successful execution commits the transaction.
-    Exceptions trigger rollback and are propagated unchanged.
+    The transaction commits when the context exits successfully
+    and rolls back if an exception occurs.
+
+    Intended for operations that must execute atomically.
     """
+
     session_factory = get_session_factory()
 
     async with session_factory() as session:
-        try:
-            async with session.begin():
-                yield session
-
-        except Exception:
-            if session.in_transaction():
-                await session.rollback()
-
-            raise
+        async with session.begin():
+            yield session
 
 
-async def close_session(session: AsyncSession) -> None:
-    """Safely close an individual database session."""
-    try:
-        await session.close()
+def clear_session_factory() -> None:
+    """
+    Clear the cached session factory.
 
-    except Exception as exc:
-        raise DatabaseError(
-            "Unable to close the database session."
-        ) from exc
+    Call during database shutdown or when replacing the engine.
+    This does not dispose the underlying database engine.
+    """
 
-
-def clear_session_factory_cache() -> None:
-    """Clear the cached session factory."""
     get_session_factory.cache_clear()
