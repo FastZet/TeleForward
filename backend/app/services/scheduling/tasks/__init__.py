@@ -1,7 +1,7 @@
-"""Scheduled task implementations for TeleForward.
+"""Scheduled task implementations and registration utilities.
 
-Task classes are loaded lazily to minimise import side effects and
-reduce the risk of circular dependencies during application startup.
+Task classes and utilities are loaded lazily to minimise import
+side effects and reduce circular dependency risks.
 """
 
 from __future__ import annotations
@@ -19,6 +19,9 @@ if TYPE_CHECKING:
     from app.services.scheduling.tasks.cleanup import (
         CleanupScheduledTask,
     )
+    from app.services.scheduling.tasks.factory import (
+        ScheduledTaskFactory,
+    )
     from app.services.scheduling.tasks.forwarding import (
         ForwardingScheduledTask,
     )
@@ -30,6 +33,9 @@ if TYPE_CHECKING:
     )
     from app.services.scheduling.tasks.session_maintenance import (
         SessionMaintenanceScheduledTask,
+    )
+    from app.services.scheduling.tasks.task_registry import (
+        ScheduledTaskRegistry,
     )
     from app.services.scheduling.tasks.telegram_sync import (
         TelegramSyncScheduledTask,
@@ -61,6 +67,14 @@ _EXPORTS: dict[str, tuple[str, str]] = {
         ".notification_dispatch",
         "NotificationDispatchScheduledTask",
     ),
+    "ScheduledTaskFactory": (
+        ".factory",
+        "ScheduledTaskFactory",
+    ),
+    "ScheduledTaskRegistry": (
+        ".task_registry",
+        "ScheduledTaskRegistry",
+    ),
     "SessionMaintenanceScheduledTask": (
         ".session_maintenance",
         "SessionMaintenanceScheduledTask",
@@ -75,7 +89,7 @@ __all__ = sorted(_EXPORTS)
 
 
 def __getattr__(name: str) -> Any:
-    """Resolve an exported task class when first accessed."""
+    """Resolve an exported symbol when first accessed."""
 
     export = _EXPORTS.get(name)
 
