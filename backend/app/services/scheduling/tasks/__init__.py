@@ -10,11 +10,17 @@ from importlib import import_module
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    from app.services.scheduling.tasks.backfill import (
+        BackfillScheduledTask,
+    )
     from app.services.scheduling.tasks.backup import (
         BackupScheduledTask,
     )
     from app.services.scheduling.tasks.cleanup import (
         CleanupScheduledTask,
+    )
+    from app.services.scheduling.tasks.forwarding import (
+        ForwardingScheduledTask,
     )
     from app.services.scheduling.tasks.health_check import (
         HealthCheckScheduledTask,
@@ -31,6 +37,10 @@ if TYPE_CHECKING:
 
 
 _EXPORTS: dict[str, tuple[str, str]] = {
+    "BackfillScheduledTask": (
+        ".backfill",
+        "BackfillScheduledTask",
+    ),
     "BackupScheduledTask": (
         ".backup",
         "BackupScheduledTask",
@@ -38,6 +48,10 @@ _EXPORTS: dict[str, tuple[str, str]] = {
     "CleanupScheduledTask": (
         ".cleanup",
         "CleanupScheduledTask",
+    ),
+    "ForwardingScheduledTask": (
+        ".forwarding",
+        "ForwardingScheduledTask",
     ),
     "HealthCheckScheduledTask": (
         ".health_check",
@@ -61,7 +75,7 @@ __all__ = sorted(_EXPORTS)
 
 
 def __getattr__(name: str) -> Any:
-    """Resolve an exported task class when it is first accessed."""
+    """Resolve an exported task class when first accessed."""
 
     export = _EXPORTS.get(name)
 
