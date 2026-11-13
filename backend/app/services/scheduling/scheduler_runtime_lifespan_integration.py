@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from typing import Any
 
 from fastapi import FastAPI
@@ -22,72 +23,38 @@ SCHEDULER_RUNTIME_LIFESPAN_STATE_KEY = (
     "scheduler_runtime_lifespan"
 )
 
-SCHEDULER_RUNTIME_LIFESPAN_FACTORY_STATE_KEY = (
-    "scheduler_runtime_lifespan_factory"
-)
-
 
 class SchedulerRuntimeLifespanIntegrationError(RuntimeError):
     """Raised when scheduler runtime lifespan integration fails."""
 
 
 def _validate_app(app: FastAPI) -> None:
-    """Validate the FastAPI application."""
-
     if not isinstance(app, FastAPI):
         raise TypeError("app must be a FastAPI instance")
 
 
-def install_scheduler_runtime_lifespan(
-    app: FastAPI,
+def create_scheduler_runtime_lifespan_integration(
     *,
-    before_start: Any | None = None,
-    after_start: Any | None = None,
-    before_shutdown: Any | None = None,
-    after_shutdown: Any | None = None,
-    replace: bool = False,
+    before_start: Callable[..., Any] | None = None,
+    after_start: Callable[..., Any] | None = None,
+    before_shutdown: Callable[..., Any] | None = None,
+    after_shutdown: Callable[..., Any] | None = None,
 ):
     """
-    Create and register the scheduler runtime lifespan callable.
+    Create a scheduler runtime lifespan callable independently
+    of a FastAPI application instance.
 
-    The scheduler runtime must already be installed in app.state.
+    Usage:
 
-    This function stores the lifespan callable in application state.
-    The caller must pass the returned callable to FastAPI during
-    application construction:
+        lifespan = create_scheduler_runtime_lifespan_integration()
 
-        lifespan = install_scheduler_runtime_lifespan(
-            app,
-        )
+        app = FastAPI(lifespan=lifespan)
 
-        application = FastAPI(lifespan=lifespan)
+        install_scheduler_runtime(app, runtime)
 
-    The app supplied to this function must be the same application
-    instance that will be used by the lifespan.
+    The scheduler runtime must be installed on the same application
+    instance that FastAPI passes to the lifespan.
     """
-
-    _validate_app(app)
-
-    if not isinstance(replace, bool):
-        raise TypeError("replace must be a boolean")
-
-    try:
-        get_scheduler_runtime(app)
-    except SchedulerRuntimeIntegrationError as exc:
-        raise SchedulerRuntimeLifespanIntegrationError(
-            "Install the scheduler runtime before its lifespan"
-        ) from exc
-
-    existing = getattr(
-        app.state,
-        SCHEDULER_RUNTIME_LIFESPAN_STATE_KEY,
-        None,
-    )
-
-    if existing is not None and not replace:
-        raise SchedulerRuntimeLifespanIntegrationError(
-            "Scheduler runtime lifespan is already installed"
-        )
 
     callbacks = {
         "before_start": before_start,
@@ -101,40 +68,68 @@ def install_scheduler_runtime_lifespan(
             raise TypeError(f"{name} must be callable")
 
     try:
-        lifespan = create_scheduler_runtime_lifespan(
+        return create_scheduler_runtime_lifespan(
             before_start=before_start,
             after_start=after_start,
             before_shutdown=before_shutdown,
             after_shutdown=after_shutdown,
         )
-
-        setattr(
-            app.state,
-            SCHEDULER_RUNTIME_LIFESPAN_STATE_KEY,
-            lifespan,
-        )
-
-        setattr(
-            app.state,
-            SCHEDULER_RUNTIME_LIFESPAN_FACTORY_STATE_KEY,
-            create_scheduler_runtime_lifespan,
-        )
-
     except Exception as exc:
         logger.exception(
-            "Failed to install scheduler runtime lifespan"
+            "Failed to create scheduler runtime lifespan"
         )
-
         raise SchedulerRuntimeLifespanIntegrationError(
-            "Failed to install scheduler runtime lifespan"
+            "Failed to create scheduler runtime lifespan"
         ) from exc
 
-    logger.info("Scheduler runtime lifespan registered")
+
+def register_scheduler_runtime_lifespan(
+    app: FastAPI,
+    lifespan: Callable[..., Any],
+    *,
+    replace: bool = False,
+):
+    """
+    Register lifespan metadata on an already-constructed application.
+
+    This does not modify FastAPI's active lifespan configuration.
+    The supplied lifespan must already have been passed to
+    FastAPI(lifespan=...) during application construction.
+    """
+
+    _validate_app(app)
+
+    if not callable(lifespan):
+        raise TypeError("lifespan must be callable")
+
+    if not isinstance(replace, bool):
+        raise TypeError("replace must be a boolean")
+
+    existing = getattr(
+        app.state,
+        SCHEDULER_RUNTIME_LIFESPAN_STATE_KEY,
+        None,
+    )
+
+    if existing is not None and not replace:
+        raise SchedulerRuntimeLifespanIntegrationError(
+            "Scheduler runtime lifespan is already registered"
+        )
+
+    setattr(
+        app.state,
+        SCHEDULER_RUNTIME_LIFESPAN_STATE_KEY,
+        lifespan,
+    )
+
+    logger.info("Scheduler runtime lifespan metadata registered")
 
     return lifespan
 
 
-def get_scheduler_runtime_lifespan(app: FastAPI):
+def get_scheduler_runtime_lifespan(
+    app: FastAPI,
+):
     """Return the registered scheduler runtime lifespan callable."""
 
     _validate_app(app)
@@ -147,7 +142,7 @@ def get_scheduler_runtime_lifespan(app: FastAPI):
 
     if lifespan is None:
         raise SchedulerRuntimeLifespanIntegrationError(
-            "Scheduler runtime lifespan is not installed"
+            "Scheduler runtime lifespan is not registered"
         )
 
     if not callable(lifespan):
@@ -161,7 +156,7 @@ def get_scheduler_runtime_lifespan(app: FastAPI):
 def get_scheduler_runtime_lifespan_optional(
     app: FastAPI,
 ):
-    """Return the lifespan callable or None when not installed."""
+    """Return the registered lifespan callable or None."""
 
     _validate_app(app)
 
@@ -171,10 +166,7 @@ def get_scheduler_runtime_lifespan_optional(
         None,
     )
 
-    if lifespan is None:
-        return None
-
-    if not callable(lifespan):
+    if lifespan is not None and not callable(lifespan):
         raise SchedulerRuntimeLifespanIntegrationError(
             "Registered scheduler runtime lifespan is invalid"
         )
@@ -182,10 +174,10 @@ def get_scheduler_runtime_lifespan_optional(
     return lifespan
 
 
-def is_scheduler_runtime_lifespan_installed(
+def is_scheduler_runtime_lifespan_registered(
     app: FastAPI,
 ) -> bool:
-    """Check whether a scheduler runtime lifespan is registered."""
+    """Check whether lifespan metadata is registered."""
 
     return get_scheduler_runtime_lifespan_optional(app) is not None
 
@@ -194,12 +186,10 @@ def remove_scheduler_runtime_lifespan(
     app: FastAPI,
 ):
     """
-    Remove lifespan registration metadata from application state.
+    Remove lifespan metadata from application state.
 
-    This does not alter an already-constructed FastAPI application's
-    lifespan configuration and does not stop the scheduler runtime.
-
-    It only removes the integration references stored by this module.
+    This does not change the lifespan configured on the FastAPI
+    application and does not stop the scheduler runtime.
     """
 
     _validate_app(app)
@@ -211,16 +201,7 @@ def remove_scheduler_runtime_lifespan(
         SCHEDULER_RUNTIME_LIFESPAN_STATE_KEY,
     )
 
-    if hasattr(
-        app.state,
-        SCHEDULER_RUNTIME_LIFESPAN_FACTORY_STATE_KEY,
-    ):
-        delattr(
-            app.state,
-            SCHEDULER_RUNTIME_LIFESPAN_FACTORY_STATE_KEY,
-        )
-
-    logger.info("Scheduler runtime lifespan registration removed")
+    logger.info("Scheduler runtime lifespan metadata removed")
 
     return lifespan
 
@@ -228,11 +209,13 @@ def remove_scheduler_runtime_lifespan(
 def get_scheduler_runtime_lifespan_status(
     app: FastAPI,
 ) -> dict[str, Any]:
-    """Return the lifespan registration status."""
+    """Return the runtime and lifespan registration status."""
 
     _validate_app(app)
 
-    installed = is_scheduler_runtime_lifespan_installed(app)
+    lifespan_registered = is_scheduler_runtime_lifespan_registered(
+        app
+    )
 
     runtime_installed = False
 
@@ -243,9 +226,7 @@ def get_scheduler_runtime_lifespan_status(
         pass
 
     return {
-        "lifespan_installed": installed,
+        "lifespan_registered": lifespan_registered,
         "runtime_installed": runtime_installed,
-        "ready_for_application_startup": (
-            installed and runtime_installed
-        ),
+        "ready_for_application_startup": runtime_installed,
     }
