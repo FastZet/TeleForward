@@ -6,7 +6,8 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request, status
+from fastapi.params import Depends as DependsParameter
 
 from app.services.scheduling.configuration_api_security_audit_health_integration import (
     SecurityAuditHealthIntegrationError,
@@ -18,10 +19,78 @@ DEFAULT_HEALTH_ROUTE = "/health"
 DEFAULT_HEALTH_PREFIX = "/configuration/security/audit"
 
 
+def _normalize_prefix(prefix: str) -> str:
+    """Validate and normalize an API route prefix."""
+    if not isinstance(prefix, str):
+        raise TypeError("prefix must be a string")
+
+    normalized = prefix.strip()
+
+    if not normalized:
+        raise ValueError("prefix must not be empty")
+
+    if not normalized.startswith("/"):
+        normalized = f"/{normalized}"
+
+    normalized = normalized.rstrip("/")
+
+    if not normalized:
+        raise ValueError("prefix must not resolve to the root path")
+
+    if "//" in normalized:
+        raise ValueError("prefix must not contain consecutive slashes")
+
+    if "{" in normalized or "}" in normalized:
+        raise ValueError("prefix must not contain path parameters")
+
+    return normalized
+
+
+def _validate_dependencies(
+    dependencies: Sequence[DependsParameter] | None,
+) -> list[DependsParameter]:
+    """Validate router-level FastAPI dependencies."""
+    if dependencies is None:
+        return []
+
+    if isinstance(dependencies, (str, bytes)) or not isinstance(
+        dependencies,
+        Sequence,
+    ):
+        raise TypeError("dependencies must be a sequence or None")
+
+    if any(
+        not isinstance(dependency, DependsParameter)
+        for dependency in dependencies
+    ):
+        raise TypeError(
+            "dependencies must contain FastAPI Depends objects"
+        )
+
+    return list(dependencies)
+
+
+def _validate_tags(tags: list[str] | None) -> list[str]:
+    """Validate OpenAPI tags."""
+    if tags is None:
+        return ["Security Audit Health"]
+
+    if not isinstance(tags, list):
+        raise TypeError("tags must be a list of non-empty strings")
+
+    if any(
+        not isinstance(tag, str) or not tag.strip()
+        for tag in tags
+    ):
+        raise TypeError("tags must be a list of non-empty strings")
+
+    return [tag.strip() for tag in tags]
+
+
 def create_security_audit_health_router(
     *,
     prefix: str = DEFAULT_HEALTH_PREFIX,
-    dependencies: Sequence[Depends] | None = None,
+    dependencies: Sequence[DependsParameter] | None = None,
     tags: list[str] | None = None,
 ) -> APIRouter:
     """Create the security audit health API router.
@@ -34,45 +103,15 @@ def create_security_audit_health_router(
 
     Returns:
         An APIRouter exposing GET /health.
-
-    Raises:
-        TypeError: If an argument has an invalid type.
-        ValueError: If the route prefix is empty or invalid.
     """
-    if not isinstance(prefix, str):
-        raise TypeError("prefix must be a string")
-
-    normalized_prefix = prefix.strip()
-
-    if not normalized_prefix:
-        raise ValueError("prefix must not be empty")
-
-    if not normalized_prefix.startswith("/"):
-        normalized_prefix = f"/{normalized_prefix}"
-
-    normalized_prefix = normalized_prefix.rstrip("/")
-
-    if "//" in normalized_prefix:
-        raise ValueError("prefix must not contain consecutive slashes")
-
-    if dependencies is not None:
-        if not isinstance(dependencies, Sequence):
-            raise TypeError("dependencies must be a sequence or None")
-
-        if any(not isinstance(item, Depends) for item in dependencies):
-            raise TypeError("dependencies must contain FastAPI Depends objects")
-
-    if tags is not None:
-        if not isinstance(tags, list) or any(
-            not isinstance(tag, str) or not tag.strip()
-            for tag in tags
-        ):
-            raise TypeError("tags must be a list of non-empty strings")
+    normalized_prefix = _normalize_prefix(prefix)
+    validated_dependencies = _validate_dependencies(dependencies)
+    validated_tags = _validate_tags(tags)
 
     router = APIRouter(
         prefix=normalized_prefix,
-        dependencies=list(dependencies or []),
-        tags=tags or ["Security Audit Health"],
+        dependencies=validated_dependencies,
+        tags=validated_tags,
     )
 
     @router.get(
@@ -114,10 +153,10 @@ def create_security_audit_health_router(
 
 
 def register_security_audit_health_routes(
-    app: Any,
+    app: FastAPI,
     *,
     prefix: str = DEFAULT_HEALTH_PREFIX,
-    dependencies: Sequence[Depends] | None = None,
+    dependencies: Sequence[DependsParameter] | None = None,
     tags: list[str] | None = None,
 ) -> APIRouter:
     """Register security audit health routes on a FastAPI application.
@@ -133,29 +172,32 @@ def register_security_audit_health_routes(
 
     Raises:
         TypeError: If app is not a FastAPI application.
-        RuntimeError: If the router has already been registered.
+        RuntimeError: If the health route is already registered.
     """
-    from fastapi import FastAPI
-
     if not isinstance(app, FastAPI):
         raise TypeError("app must be a FastAPI application")
 
-    route_name = "security_audit_health"
+    # Validate arguments before modifying the application.
+    normalized_prefix = _normalize_prefix(prefix)
+    validated_dependencies = _validate_dependencies(dependencies)
+    validated_tags = _validate_tags(tags)
 
-    existing_routes = {
-        getattr(route, "name", None)
-        for route in app.routes
-    }
+    expected_path = f"{normalized_prefix}{DEFAULT_HEALTH_ROUTE}"
 
-    if route_name in existing_routes:
-        raise RuntimeError(
-            "Security audit health routes are already registered"
-        )
+    for route in app.routes:
+        if (
+            getattr(route, "path", None) == expected_path
+            and "GET" in (getattr(route, "methods", None) or set())
+        ):
+            raise RuntimeError(
+                f"Security audit health route already exists: "
+                f"GET {expected_path}"
+            )
 
     router = create_security_audit_health_router(
-        prefix=prefix,
-        dependencies=dependencies,
-        tags=tags,
+        prefix=normalized_prefix,
+        dependencies=validated_dependencies,
+        tags=validated_tags,
     )
 
     app.include_router(router)
