@@ -1,5 +1,5 @@
 
-"""Tests for scheduler runtime lifespan integration helpers."""
+"""Tests for scheduler runtime lifespan integration."""
 
 from __future__ import annotations
 
@@ -13,18 +13,15 @@ from app.services.scheduling.scheduler_runtime import SchedulerRuntime
 from app.services.scheduling.scheduler_runtime_integration import (
     install_scheduler_runtime,
 )
-from app.services.scheduling.scheduler_runtime_lifespan import (
-    create_scheduler_runtime_lifespan,
-)
 from app.services.scheduling.scheduler_runtime_lifespan_integration import (
-    SCHEDULER_RUNTIME_LIFESPAN_FACTORY_STATE_KEY,
     SCHEDULER_RUNTIME_LIFESPAN_STATE_KEY,
     SchedulerRuntimeLifespanIntegrationError,
+    create_scheduler_runtime_lifespan_integration,
     get_scheduler_runtime_lifespan,
     get_scheduler_runtime_lifespan_optional,
     get_scheduler_runtime_lifespan_status,
-    install_scheduler_runtime_lifespan,
-    is_scheduler_runtime_lifespan_installed,
+    is_scheduler_runtime_lifespan_registered,
+    register_scheduler_runtime_lifespan,
     remove_scheduler_runtime_lifespan,
 )
 from app.services.scheduling.tasks.task_registry import (
@@ -33,22 +30,25 @@ from app.services.scheduling.tasks.task_registry import (
 
 
 class FakeManager:
-    """Minimal scheduler manager for lifespan integration tests."""
+    """Minimal scheduler manager for integration tests."""
 
     def __init__(self) -> None:
         self.start_calls = 0
         self.shutdown_calls = 0
+        self.fail_start = False
+        self.fail_shutdown = False
 
     async def start(self) -> None:
         self.start_calls += 1
 
+        if self.fail_start:
+            raise RuntimeError("Manager startup failed")
+
     async def shutdown(self) -> None:
         self.shutdown_calls += 1
 
-
-@pytest.fixture
-def app() -> FastAPI:
-    return FastAPI()
+        if self.fail_shutdown:
+            raise RuntimeError("Manager shutdown failed")
 
 
 @pytest.fixture
@@ -65,106 +65,38 @@ def runtime(manager: FakeManager) -> SchedulerRuntime:
 
 
 @pytest.fixture
-def installed_app(
-    app: FastAPI,
+def lifespan():
+    return create_scheduler_runtime_lifespan_integration()
+
+
+@pytest.fixture
+def app(
     runtime: SchedulerRuntime,
+    lifespan,
 ) -> FastAPI:
-    install_scheduler_runtime(app, runtime)
-    return app
+    application = FastAPI(lifespan=lifespan)
+    install_scheduler_runtime(application, runtime)
+    register_scheduler_runtime_lifespan(application, lifespan)
+    return application
 
 
-def test_install_scheduler_runtime_lifespan(
-    installed_app: FastAPI,
-) -> None:
-    lifespan = install_scheduler_runtime_lifespan(installed_app)
+def test_create_lifespan_without_application() -> None:
+    lifespan = create_scheduler_runtime_lifespan_integration()
 
     assert callable(lifespan)
-    assert (
-        getattr(
-            installed_app.state,
-            SCHEDULER_RUNTIME_LIFESPAN_STATE_KEY,
-        )
-        is lifespan
-    )
 
 
-def test_install_stores_factory_reference(
-    installed_app: FastAPI,
-) -> None:
-    install_scheduler_runtime_lifespan(installed_app)
-
-    factory = getattr(
-        installed_app.state,
-        SCHEDULER_RUNTIME_LIFESPAN_FACTORY_STATE_KEY,
-    )
-
-    assert factory is create_scheduler_runtime_lifespan
-
-
-def test_install_requires_runtime_first(
-    app: FastAPI,
-) -> None:
-    with pytest.raises(
-        SchedulerRuntimeLifespanIntegrationError,
-        match="Install the scheduler runtime",
-    ):
-        install_scheduler_runtime_lifespan(app)
-
-
-def test_install_rejects_invalid_application() -> None:
-    with pytest.raises(TypeError, match="FastAPI"):
-        install_scheduler_runtime_lifespan(
-            object(),  # type: ignore[arg-type]
+def test_create_lifespan_rejects_invalid_callback() -> None:
+    with pytest.raises(TypeError, match="before_start"):
+        create_scheduler_runtime_lifespan_integration(
+            before_start="invalid",  # type: ignore[arg-type]
         )
 
 
-def test_install_rejects_invalid_replace_option(
-    installed_app: FastAPI,
-) -> None:
-    with pytest.raises(TypeError, match="boolean"):
-        install_scheduler_runtime_lifespan(
-            installed_app,
-            replace=1,  # type: ignore[arg-type]
-        )
+def test_create_lifespan_accepts_callbacks() -> None:
+    callback = lambda app: None
 
-
-def test_install_is_rejected_when_already_installed(
-    installed_app: FastAPI,
-) -> None:
-    install_scheduler_runtime_lifespan(installed_app)
-
-    with pytest.raises(
-        SchedulerRuntimeLifespanIntegrationError,
-        match="already installed",
-    ):
-        install_scheduler_runtime_lifespan(installed_app)
-
-
-def test_install_allows_replacement(
-    installed_app: FastAPI,
-) -> None:
-    original = install_scheduler_runtime_lifespan(installed_app)
-
-    replacement = install_scheduler_runtime_lifespan(
-        installed_app,
-        replace=True,
-    )
-
-    assert replacement is not original
-    assert (
-        get_scheduler_runtime_lifespan(installed_app)
-        is replacement
-    )
-
-
-def test_install_accepts_callbacks(
-    installed_app: FastAPI,
-) -> None:
-    def callback(app: FastAPI) -> None:
-        pass
-
-    lifespan = install_scheduler_runtime_lifespan(
-        installed_app,
+    lifespan = create_scheduler_runtime_lifespan_integration(
         before_start=callback,
         after_start=callback,
         before_shutdown=callback,
@@ -174,156 +106,160 @@ def test_install_accepts_callbacks(
     assert callable(lifespan)
 
 
-@pytest.mark.parametrize(
-    ("argument", "value"),
-    [
-        ("before_start", "invalid"),
-        ("after_start", "invalid"),
-        ("before_shutdown", "invalid"),
-        ("after_shutdown", "invalid"),
-    ],
-)
-def test_install_rejects_invalid_callbacks(
-    installed_app: FastAPI,
-    argument: str,
-    value: str,
-) -> None:
-    with pytest.raises(TypeError):
-        install_scheduler_runtime_lifespan(
-            installed_app,
-            **{argument: value},
+def test_register_lifespan_metadata(app: FastAPI, lifespan) -> None:
+    assert (
+        getattr(app.state, SCHEDULER_RUNTIME_LIFESPAN_STATE_KEY)
+        is lifespan
+    )
+
+
+def test_register_rejects_invalid_application(lifespan) -> None:
+    with pytest.raises(TypeError, match="FastAPI"):
+        register_scheduler_runtime_lifespan(
+            object(),  # type: ignore[arg-type]
+            lifespan,
         )
 
 
-def test_get_scheduler_runtime_lifespan(
-    installed_app: FastAPI,
+def test_register_rejects_non_callable_lifespan(
+    app: FastAPI,
 ) -> None:
-    lifespan = install_scheduler_runtime_lifespan(installed_app)
+    with pytest.raises(TypeError, match="callable"):
+        register_scheduler_runtime_lifespan(
+            app,
+            object(),  # type: ignore[arg-type]
+        )
 
-    assert get_scheduler_runtime_lifespan(installed_app) is lifespan
+
+def test_register_rejects_invalid_replace_option(
+    app: FastAPI,
+    lifespan,
+) -> None:
+    with pytest.raises(TypeError, match="boolean"):
+        register_scheduler_runtime_lifespan(
+            app,
+            lifespan,
+            replace=1,  # type: ignore[arg-type]
+        )
 
 
-def test_get_scheduler_runtime_lifespan_rejects_missing(
-    installed_app: FastAPI,
+def test_duplicate_registration_is_rejected(
+    app: FastAPI,
+    lifespan,
 ) -> None:
     with pytest.raises(
         SchedulerRuntimeLifespanIntegrationError,
-        match="not installed",
+        match="already registered",
     ):
-        get_scheduler_runtime_lifespan(installed_app)
+        register_scheduler_runtime_lifespan(app, lifespan)
 
 
-def test_get_optional_lifespan_when_missing(
-    installed_app: FastAPI,
+def test_replacement_is_allowed(
+    app: FastAPI,
 ) -> None:
-    assert get_scheduler_runtime_lifespan_optional(installed_app) is None
+    original = get_scheduler_runtime_lifespan(app)
+
+    replacement = create_scheduler_runtime_lifespan_integration()
+
+    register_scheduler_runtime_lifespan(
+        app,
+        replacement,
+        replace=True,
+    )
+
+    assert get_scheduler_runtime_lifespan(app) is replacement
+    assert get_scheduler_runtime_lifespan(app) is not original
 
 
-def test_get_optional_lifespan_when_installed(
-    installed_app: FastAPI,
+def test_get_lifespan(app: FastAPI, lifespan) -> None:
+    assert get_scheduler_runtime_lifespan(app) is lifespan
+
+
+def test_get_lifespan_rejects_missing_registration() -> None:
+    app = FastAPI()
+
+    with pytest.raises(
+        SchedulerRuntimeLifespanIntegrationError,
+        match="not registered",
+    ):
+        get_scheduler_runtime_lifespan(app)
+
+
+def test_get_optional_lifespan_when_missing() -> None:
+    assert get_scheduler_runtime_lifespan_optional(
+        FastAPI()
+    ) is None
+
+
+def test_get_optional_lifespan_when_registered(
+    app: FastAPI,
+    lifespan,
 ) -> None:
-    lifespan = install_scheduler_runtime_lifespan(installed_app)
-
-    assert get_scheduler_runtime_lifespan_optional(installed_app) is lifespan
+    assert get_scheduler_runtime_lifespan_optional(app) is lifespan
 
 
-def test_is_lifespan_installed_when_missing(
-    installed_app: FastAPI,
-) -> None:
-    assert is_scheduler_runtime_lifespan_installed(installed_app) is False
+def test_is_registered_when_missing() -> None:
+    assert is_scheduler_runtime_lifespan_registered(
+        FastAPI()
+    ) is False
 
 
-def test_is_lifespan_installed_when_present(
-    installed_app: FastAPI,
-) -> None:
-    install_scheduler_runtime_lifespan(installed_app)
-
-    assert is_scheduler_runtime_lifespan_installed(installed_app) is True
+def test_is_registered_when_present(app: FastAPI) -> None:
+    assert is_scheduler_runtime_lifespan_registered(app) is True
 
 
-def test_status_before_lifespan_registration(
-    installed_app: FastAPI,
-) -> None:
-    status = get_scheduler_runtime_lifespan_status(installed_app)
-
-    assert status == {
-        "lifespan_installed": False,
-        "runtime_installed": True,
-        "ready_for_application_startup": False,
-    }
-
-
-def test_status_after_lifespan_registration(
-    installed_app: FastAPI,
-) -> None:
-    install_scheduler_runtime_lifespan(installed_app)
-
-    status = get_scheduler_runtime_lifespan_status(installed_app)
-
-    assert status == {
-        "lifespan_installed": True,
+def test_status_reports_installed_runtime(app: FastAPI) -> None:
+    assert get_scheduler_runtime_lifespan_status(app) == {
+        "lifespan_registered": True,
         "runtime_installed": True,
         "ready_for_application_startup": True,
     }
 
 
-def test_status_rejects_invalid_application() -> None:
-    with pytest.raises(TypeError, match="FastAPI"):
-        get_scheduler_runtime_lifespan_status(
-            object(),  # type: ignore[arg-type]
-        )
+def test_status_reports_missing_runtime(lifespan) -> None:
+    app = FastAPI(lifespan=lifespan)
+    register_scheduler_runtime_lifespan(app, lifespan)
+
+    assert get_scheduler_runtime_lifespan_status(app) == {
+        "lifespan_registered": True,
+        "runtime_installed": False,
+        "ready_for_application_startup": False,
+    }
 
 
-def test_remove_lifespan_registration(
-    installed_app: FastAPI,
-) -> None:
-    lifespan = install_scheduler_runtime_lifespan(installed_app)
-
-    removed = remove_scheduler_runtime_lifespan(installed_app)
+def test_remove_registration(app: FastAPI, lifespan) -> None:
+    removed = remove_scheduler_runtime_lifespan(app)
 
     assert removed is lifespan
-    assert is_scheduler_runtime_lifespan_installed(installed_app) is False
+    assert not is_scheduler_runtime_lifespan_registered(app)
 
 
-def test_remove_clears_factory_reference(
-    installed_app: FastAPI,
+def test_remove_does_not_change_fastapi_lifespan(
+    app: FastAPI,
+    lifespan,
 ) -> None:
-    install_scheduler_runtime_lifespan(installed_app)
+    remove_scheduler_runtime_lifespan(app)
 
-    remove_scheduler_runtime_lifespan(installed_app)
-
-    assert not hasattr(
-        installed_app.state,
-        SCHEDULER_RUNTIME_LIFESPAN_FACTORY_STATE_KEY,
-    )
+    # Registration metadata is separate from FastAPI's
+    # constructor-configured lifespan.
+    assert app.router.lifespan_context is lifespan
 
 
-def test_remove_rejects_missing_registration(
-    installed_app: FastAPI,
-) -> None:
+def test_remove_rejects_missing_registration() -> None:
     with pytest.raises(
         SchedulerRuntimeLifespanIntegrationError,
-        match="not installed",
+        match="not registered",
     ):
-        remove_scheduler_runtime_lifespan(installed_app)
-
-
-def test_remove_rejects_invalid_application() -> None:
-    with pytest.raises(TypeError, match="FastAPI"):
-        remove_scheduler_runtime_lifespan(
-            object(),  # type: ignore[arg-type]
-        )
+        remove_scheduler_runtime_lifespan(FastAPI())
 
 
 @pytest.mark.asyncio
-async def test_registered_lifespan_starts_and_stops_runtime(
-    installed_app: FastAPI,
+async def test_lifespan_starts_and_stops_runtime(
+    app: FastAPI,
     runtime: SchedulerRuntime,
     manager: FakeManager,
 ) -> None:
-    lifespan = install_scheduler_runtime_lifespan(installed_app)
-
-    async with lifespan(installed_app):
+    async with app.router.lifespan_context(app):
         assert runtime.state == SchedulerLifecycleState.RUNNING
         assert runtime.is_running is True
 
@@ -333,20 +269,28 @@ async def test_registered_lifespan_starts_and_stops_runtime(
 
 
 @pytest.mark.asyncio
-async def test_registered_lifespan_executes_callbacks(
-    installed_app: FastAPI,
+async def test_lifespan_executes_callbacks_in_order(
+    runtime: SchedulerRuntime,
 ) -> None:
     events: list[str] = []
 
-    lifespan = install_scheduler_runtime_lifespan(
-        installed_app,
-        before_start=lambda app: events.append("before_start"),
-        after_start=lambda app: events.append("after_start"),
-        before_shutdown=lambda app: events.append("before_shutdown"),
-        after_shutdown=lambda app: events.append("after_shutdown"),
+    def callback(name: str):
+        def record(app: FastAPI) -> None:
+            events.append(name)
+
+        return record
+
+    lifespan = create_scheduler_runtime_lifespan_integration(
+        before_start=callback("before_start"),
+        after_start=callback("after_start"),
+        before_shutdown=callback("before_shutdown"),
+        after_shutdown=callback("after_shutdown"),
     )
 
-    async with lifespan(installed_app):
+    app = FastAPI(lifespan=lifespan)
+    install_scheduler_runtime(app, runtime)
+
+    async with app.router.lifespan_context(app):
         events.append("application_running")
 
     assert events == [
@@ -359,46 +303,71 @@ async def test_registered_lifespan_executes_callbacks(
 
 
 @pytest.mark.asyncio
-async def test_registered_lifespan_preserves_application_exception(
-    installed_app: FastAPI,
+async def test_lifespan_preserves_application_exception(
+    app: FastAPI,
     runtime: SchedulerRuntime,
 ) -> None:
-    lifespan = install_scheduler_runtime_lifespan(installed_app)
-
-    with pytest.raises(
-        RuntimeError,
-        match="Application failed",
-    ):
-        async with lifespan(installed_app):
+    with pytest.raises(RuntimeError, match="Application failed"):
+        async with app.router.lifespan_context(app):
             raise RuntimeError("Application failed")
 
     assert runtime.state == SchedulerLifecycleState.STOPPED
 
 
 @pytest.mark.asyncio
-async def test_registration_does_not_start_runtime(
-    installed_app: FastAPI,
+async def test_lifespan_start_failure(
+    app: FastAPI,
     runtime: SchedulerRuntime,
     manager: FakeManager,
 ) -> None:
-    install_scheduler_runtime_lifespan(installed_app)
+    manager.fail_start = True
 
+    with pytest.raises(Exception):
+        async with app.router.lifespan_context(app):
+            pass
+
+    assert runtime.state == SchedulerLifecycleState.STOPPED
+    assert manager.start_calls == 1
+    assert manager.shutdown_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_lifespan_shutdown_failure(
+    app: FastAPI,
+    runtime: SchedulerRuntime,
+    manager: FakeManager,
+) -> None:
+    manager.fail_shutdown = True
+
+    with pytest.raises(Exception):
+        async with app.router.lifespan_context(app):
+            pass
+
+    assert runtime.state == SchedulerLifecycleState.FAILED
+    assert manager.start_calls == 1
+    assert manager.shutdown_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_registration_does_not_start_runtime(
+    app: FastAPI,
+    runtime: SchedulerRuntime,
+    manager: FakeManager,
+) -> None:
     assert runtime.state == SchedulerLifecycleState.STOPPED
     assert manager.start_calls == 0
     assert manager.shutdown_calls == 0
 
 
 @pytest.mark.asyncio
-async def test_removal_does_not_stop_runtime_automatically(
-    installed_app: FastAPI,
+async def test_removing_metadata_does_not_stop_runtime(
+    app: FastAPI,
     runtime: SchedulerRuntime,
     manager: FakeManager,
 ) -> None:
     await runtime.start()
 
-    install_scheduler_runtime_lifespan(installed_app)
-
-    remove_scheduler_runtime_lifespan(installed_app)
+    remove_scheduler_runtime_lifespan(app)
 
     assert runtime.state == SchedulerLifecycleState.RUNNING
     assert manager.shutdown_calls == 0
@@ -407,28 +376,9 @@ async def test_removal_does_not_stop_runtime_automatically(
 
 
 @pytest.mark.asyncio
-async def test_replacement_does_not_start_runtime(
-    installed_app: FastAPI,
-    runtime: SchedulerRuntime,
+async def test_separate_applications_have_independent_lifespans(
     manager: FakeManager,
 ) -> None:
-    install_scheduler_runtime_lifespan(installed_app)
-
-    install_scheduler_runtime_lifespan(
-        installed_app,
-        replace=True,
-    )
-
-    assert runtime.state == SchedulerLifecycleState.STOPPED
-    assert manager.start_calls == 0
-
-
-def test_separate_applications_have_independent_registrations(
-    manager: FakeManager,
-) -> None:
-    first_app = FastAPI()
-    second_app = FastAPI()
-
     first_runtime = SchedulerRuntime(
         manager,
         ScheduledTaskRegistry(),
@@ -438,15 +388,24 @@ def test_separate_applications_have_independent_registrations(
         ScheduledTaskRegistry(),
     )
 
+    first_lifespan = create_scheduler_runtime_lifespan_integration()
+    second_lifespan = create_scheduler_runtime_lifespan_integration()
+
+    first_app = FastAPI(lifespan=first_lifespan)
+    second_app = FastAPI(lifespan=second_lifespan)
+
     install_scheduler_runtime(first_app, first_runtime)
     install_scheduler_runtime(second_app, second_runtime)
 
-    first_lifespan = install_scheduler_runtime_lifespan(first_app)
-    second_lifespan = install_scheduler_runtime_lifespan(second_app)
+    register_scheduler_runtime_lifespan(first_app, first_lifespan)
+    register_scheduler_runtime_lifespan(second_app, second_lifespan)
 
-    assert first_lifespan is not second_lifespan
+    assert get_scheduler_runtime_lifespan(first_app) is first_lifespan
+    assert get_scheduler_runtime_lifespan(second_app) is second_lifespan
 
-    remove_scheduler_runtime_lifespan(first_app)
+    async with first_app.router.lifespan_context(first_app):
+        assert first_runtime.is_running
+        assert not second_runtime.is_running
 
-    assert is_scheduler_runtime_lifespan_installed(first_app) is False
-    assert is_scheduler_runtime_lifespan_installed(second_app) is True
+    assert first_runtime.state == SchedulerLifecycleState.STOPPED
+    assert second_runtime.state == SchedulerLifecycleState.STOPPED
