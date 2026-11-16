@@ -1,19 +1,21 @@
 
-"""Integrated cancellation-aware scheduler health API lifespan.
+"""Hardened integrated scheduler health API lifespan.
 
 Composes the bootstrap health API integration with an existing FastAPI
 lifespan and cancellation-aware cleanup.
 
 Exception policy:
-- Primary application/startup exceptions are preserved.
-- Existing lifespan context managers retain their suppression semantics.
-- Every registered shutdown operation is attempted.
-- Cleanup cancellation is kept separate from ordinary cleanup failures.
-- Cleanup failures are retained in structured reports.
+- Preserve primary application and startup exceptions.
+- Respect ordinary exception suppression by existing lifespan contexts.
+- Never allow an existing lifespan to suppress primary cancellation.
+- Attempt all registered shutdown operations.
+- Retain cleanup failures and cancellation diagnostics.
+- Do not replace a primary exception with secondary cleanup failures.
 """
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import logging
 from collections.abc import AsyncIterator, Callable
@@ -167,6 +169,50 @@ def _validate_arguments(
         raise TypeError("lifespan callbacks must be callable")
 
 
+def _attach_cleanup_diagnostics(
+    primary_error: BaseException,
+    report: CleanupReport,
+) -> None:
+    """Attach secondary cleanup failures to the primary exception."""
+
+    if not report.failures and report.cancellation is None:
+        return
+
+    details: list[str] = []
+
+    for failure in report.failures:
+        details.append(
+            f"{failure.operation}: "
+            f"{type(failure.error).__name__}: {failure.error}"
+        )
+
+    if report.cancellation is not None:
+        details.append(
+            "Cleanup cancellation: "
+            f"{report.cancellation!r}"
+        )
+
+    diagnostic = (
+        "Secondary lifespan cleanup diagnostics: "
+        + "; ".join(details)
+    )
+
+    add_note = getattr(primary_error, "add_note", None)
+
+    if callable(add_note):
+        add_note(diagnostic)
+
+    logger.error(
+        "%s",
+        diagnostic,
+        exc_info=(
+            type(primary_error),
+            primary_error,
+            primary_error.__traceback__,
+        ),
+    )
+
+
 def create_integrated_bootstrap_health_lifespan(
     *,
     service: SchedulingBootstrapHealthService | None = None,
@@ -190,8 +236,8 @@ def create_integrated_bootstrap_health_lifespan(
         2. Run after_shutdown if integration was installed.
         3. Exit the existing application lifespan if entered.
 
-    Existing context-manager suppression is respected. Cleanup failures
-    do not silently replace an unsuppressed primary exception.
+    An existing lifespan can suppress ordinary exceptions. It cannot
+    suppress the primary application cancellation.
     """
 
     callbacks = (
@@ -255,21 +301,21 @@ def create_integrated_bootstrap_health_lifespan(
         operations: list[tuple[str, Callable[[], Any]]] = []
 
         if integration_installed:
-            operations.append(
-                (
-                    "before_shutdown",
-                    lambda: _invoke_callback(before_shutdown, app),
-                )
-            )
-
-            operations.append(
-                (
-                    "after_shutdown",
-                    lambda: _invoke_callback(after_shutdown, app),
-                )
+            operations.extend(
+                [
+                    (
+                        "before_shutdown",
+                        lambda: _invoke_callback(before_shutdown, app),
+                    ),
+                    (
+                        "after_shutdown",
+                        lambda: _invoke_callback(after_shutdown, app),
+                    ),
+                ]
             )
 
         if existing_context_entered:
+
             async def exit_existing_lifespan() -> None:
                 nonlocal exception_suppressed
 
@@ -298,19 +344,21 @@ def create_integrated_bootstrap_health_lifespan(
         if operations:
             report = await execute_cleanup_resiliently(operations)
 
-        if primary_error is not None and not exception_suppressed:
-            if report is not None and (
-                report.failures or report.cancellation is not None
-            ):
-                logger.error(
-                    "Lifespan cleanup encountered errors while "
-                    "preserving the primary exception. "
-                    "Cleanup report: %r",
-                    report,
-                )
+        # Cancellation is never suppressible by an existing lifespan.
+        if isinstance(primary_error, asyncio.CancelledError):
+            if report is not None:
+                _attach_cleanup_diagnostics(primary_error, report)
 
             raise primary_error.with_traceback(primary_traceback)
 
+        # Ordinary exceptions may be suppressed by the existing lifespan.
+        if primary_error is not None and not exception_suppressed:
+            if report is not None:
+                _attach_cleanup_diagnostics(primary_error, report)
+
+            raise primary_error.with_traceback(primary_traceback)
+
+        # No primary exception remains to preserve.
         if report is None:
             return
 
