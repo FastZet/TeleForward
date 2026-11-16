@@ -1,8 +1,10 @@
 
-"""Tests for scheduling integration bootstrap."""
+"""Tests for scheduling integration bootstrap concurrency and cancellation."""
 
 from __future__ import annotations
 
+import asyncio
+from collections.abc import Callable
 from typing import Any
 
 import pytest
@@ -129,7 +131,7 @@ def components() -> dict[str, object]:
 
 def make_factories(
     components: dict[str, object],
-) -> dict[str, Any]:
+) -> dict[str, Callable[[], Any]]:
     return {
         name: (lambda component=component: component)
         for name, component in components.items()
@@ -145,7 +147,8 @@ def bootstrap(
     )
 
 
-def test_initial_state_is_not_started(
+@pytest.mark.asyncio
+async def test_initial_state_is_not_started(
     bootstrap: SchedulingIntegrationBootstrap,
 ) -> None:
     assert bootstrap.state is BootstrapState.NOT_STARTED
@@ -153,7 +156,7 @@ def test_initial_state_is_not_started(
 
 
 @pytest.mark.asyncio
-async def test_bootstrap_with_sync_factories(
+async def test_sync_factories_bootstrap_successfully(
     bootstrap: SchedulingIntegrationBootstrap,
 ) -> None:
     report = await bootstrap.bootstrap()
@@ -166,7 +169,7 @@ async def test_bootstrap_with_sync_factories(
 
 
 @pytest.mark.asyncio
-async def test_bootstrap_with_async_factories(
+async def test_async_factories_bootstrap_successfully(
     components: dict[str, object],
 ) -> None:
     async def factory(component: object) -> object:
@@ -188,7 +191,7 @@ async def test_bootstrap_with_async_factories(
 
 
 @pytest.mark.asyncio
-async def test_bootstrap_uses_manager_scheduler_when_optional_factory_absent(
+async def test_optional_scheduler_factory_can_be_omitted(
     components: dict[str, object],
 ) -> None:
     factories = make_factories(components)
@@ -196,9 +199,8 @@ async def test_bootstrap_uses_manager_scheduler_when_optional_factory_absent(
 
     bootstrap = SchedulingIntegrationBootstrap(factories)
 
-    report = await bootstrap.bootstrap()
+    await bootstrap.bootstrap()
 
-    assert report.context_created is True
     assert (
         bootstrap.context.scheduler.component
         is components["scheduler"]
@@ -206,7 +208,7 @@ async def test_bootstrap_uses_manager_scheduler_when_optional_factory_absent(
 
 
 @pytest.mark.asyncio
-async def test_bootstrap_is_idempotent_when_ready(
+async def test_bootstrap_is_idempotent_after_success(
     bootstrap: SchedulingIntegrationBootstrap,
 ) -> None:
     first = await bootstrap.bootstrap()
@@ -217,7 +219,7 @@ async def test_bootstrap_is_idempotent_when_ready(
 
 
 @pytest.mark.asyncio
-async def test_bootstrap_exposes_context_after_success(
+async def test_context_is_available_after_success(
     bootstrap: SchedulingIntegrationBootstrap,
 ) -> None:
     await bootstrap.bootstrap()
@@ -246,8 +248,12 @@ async def test_factory_returning_none_fails_bootstrap(
         await bootstrap.bootstrap()
 
     assert bootstrap.state is BootstrapState.FAILED
-    assert bootstrap.context if False else bootstrap.report is not None
+    assert bootstrap.report is not None
     assert bootstrap.report.state is BootstrapState.FAILED
+    assert bootstrap.report.context_created is False
+
+    with pytest.raises(SchedulingBootstrapError):
+        _ = bootstrap.context
 
 
 @pytest.mark.asyncio
@@ -269,7 +275,7 @@ async def test_factory_exception_fails_bootstrap(
     assert isinstance(error.value.__cause__, RuntimeError)
     assert bootstrap.state is BootstrapState.FAILED
     assert bootstrap.report is not None
-    assert "factory failure" in bootstrap.report.error
+    assert "factory failure" in (bootstrap.report.error or "")
 
 
 @pytest.mark.asyncio
@@ -316,9 +322,7 @@ def test_non_callable_factory_is_rejected(
 
 def test_invalid_factory_mapping_is_rejected() -> None:
     with pytest.raises(TypeError):
-        SchedulingIntegrationBootstrap(
-            None  # type: ignore[arg-type]
-        )
+        SchedulingIntegrationBootstrap(None)  # type: ignore[arg-type]
 
 
 def test_invalid_validator_type_is_rejected(
@@ -336,7 +340,6 @@ async def test_close_releases_context(
     bootstrap: SchedulingIntegrationBootstrap,
 ) -> None:
     await bootstrap.bootstrap()
-
     bootstrap.close()
 
     assert bootstrap.state is BootstrapState.CLOSED
@@ -368,7 +371,7 @@ async def test_close_before_bootstrap_is_allowed(
 
 
 @pytest.mark.asyncio
-async def test_close_does_not_close_underlying_job_store(
+async def test_close_does_not_close_job_store(
     components: dict[str, object],
 ) -> None:
     class TrackingJobStore(FakeJobStore):
@@ -380,9 +383,6 @@ async def test_close_does_not_close_underlying_job_store(
 
     store = TrackingJobStore()
     components["job_store"] = store
-    components["scheduler_manager"] = FakeSchedulerManager(
-        components["scheduler"]  # type: ignore[arg-type]
-    )
 
     bootstrap = SchedulingIntegrationBootstrap(
         make_factories(components)
@@ -398,8 +398,6 @@ async def test_close_does_not_close_underlying_job_store(
 async def test_bootstrap_does_not_start_scheduler(
     components: dict[str, object],
 ) -> None:
-    scheduler = components["scheduler"]
-
     class TrackingScheduler(FakeScheduler):
         def __init__(self) -> None:
             self.started = False
@@ -407,12 +405,10 @@ async def test_bootstrap_does_not_start_scheduler(
         def start(self) -> None:
             self.started = True
 
-    tracking_scheduler = TrackingScheduler()
+    scheduler = TrackingScheduler()
 
-    components["scheduler"] = tracking_scheduler
-    components["scheduler_manager"] = FakeSchedulerManager(
-        tracking_scheduler
-    )
+    components["scheduler"] = scheduler
+    components["scheduler_manager"] = FakeSchedulerManager(scheduler)
 
     bootstrap = SchedulingIntegrationBootstrap(
         make_factories(components)
@@ -420,7 +416,7 @@ async def test_bootstrap_does_not_start_scheduler(
 
     await bootstrap.bootstrap()
 
-    assert tracking_scheduler.started is False
+    assert scheduler.started is False
 
 
 @pytest.mark.asyncio
@@ -449,6 +445,206 @@ async def test_failed_bootstrap_can_be_retried(
     report = await bootstrap.bootstrap()
 
     assert report.state is BootstrapState.READY
+    assert bootstrap.state is BootstrapState.READY
+
+
+@pytest.mark.asyncio
+async def test_concurrent_bootstrap_calls_build_components_once(
+    components: dict[str, object],
+) -> None:
+    calls = 0
+    factory_started = asyncio.Event()
+    allow_factory_to_finish = asyncio.Event()
+
+    async def manager_factory() -> object:
+        nonlocal calls
+        calls += 1
+        factory_started.set()
+        await allow_factory_to_finish.wait()
+        return components["scheduler_manager"]
+
+    factories = make_factories(components)
+    factories["scheduler_manager"] = manager_factory
+
+    bootstrap = SchedulingIntegrationBootstrap(factories)
+
+    first = asyncio.create_task(bootstrap.bootstrap())
+
+    await factory_started.wait()
+
+    second = asyncio.create_task(bootstrap.bootstrap())
+
+    allow_factory_to_finish.set()
+
+    first_report, second_report = await asyncio.gather(
+        first,
+        second,
+    )
+
+    assert first_report is second_report
+    assert calls == 1
+    assert bootstrap.state is BootstrapState.READY
+
+
+@pytest.mark.asyncio
+async def test_concurrent_bootstrap_calls_share_context(
+    components: dict[str, object],
+) -> None:
+    factory_started = asyncio.Event()
+    allow_factory_to_finish = asyncio.Event()
+
+    async def manager_factory() -> object:
+        factory_started.set()
+        await allow_factory_to_finish.wait()
+        return components["scheduler_manager"]
+
+    factories = make_factories(components)
+    factories["scheduler_manager"] = manager_factory
+
+    bootstrap = SchedulingIntegrationBootstrap(factories)
+
+    first = asyncio.create_task(bootstrap.bootstrap())
+    await factory_started.wait()
+
+    second = asyncio.create_task(bootstrap.bootstrap())
+
+    allow_factory_to_finish.set()
+
+    await asyncio.gather(first, second)
+
+    assert bootstrap.context.is_validated is True
+    assert bootstrap.state is BootstrapState.READY
+
+
+@pytest.mark.asyncio
+async def test_cancellation_during_factory_marks_bootstrap_failed(
+    components: dict[str, object],
+) -> None:
+    factory_started = asyncio.Event()
+    never_finish = asyncio.Event()
+
+    async def blocking_factory() -> object:
+        factory_started.set()
+        await never_finish.wait()
+        return components["task_registry"]
+
+    factories = make_factories(components)
+    factories["task_registry"] = blocking_factory
+
+    bootstrap = SchedulingIntegrationBootstrap(factories)
+
+    task = asyncio.create_task(bootstrap.bootstrap())
+
+    await factory_started.wait()
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert bootstrap.state is BootstrapState.FAILED
+    assert bootstrap.report is not None
+    assert bootstrap.report.error == "Bootstrap was cancelled"
+    assert bootstrap.report.context_created is False
+
+
+@pytest.mark.asyncio
+async def test_cancelled_bootstrap_can_be_retried(
+    components: dict[str, object],
+) -> None:
+    calls = 0
+    factory_started = asyncio.Event()
+    never_finish = asyncio.Event()
+
+    async def initially_blocking_factory() -> object:
+        nonlocal calls
+        calls += 1
+
+        if calls == 1:
+            factory_started.set()
+            await never_finish.wait()
+
+        return components["task_registry"]
+
+    factories = make_factories(components)
+    factories["task_registry"] = initially_blocking_factory
+
+    bootstrap = SchedulingIntegrationBootstrap(factories)
+
+    task = asyncio.create_task(bootstrap.bootstrap())
+    await factory_started.wait()
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    report = await bootstrap.bootstrap()
+
+    assert report.state is BootstrapState.READY
+    assert calls == 2
+
+
+@pytest.mark.asyncio
+async def test_cancellation_while_waiting_for_lock_does_not_corrupt_state(
+    components: dict[str, object],
+) -> None:
+    factory_started = asyncio.Event()
+    allow_factory_to_finish = asyncio.Event()
+
+    async def blocking_factory() -> object:
+        factory_started.set()
+        await allow_factory_to_finish.wait()
+        return components["task_registry"]
+
+    factories = make_factories(components)
+    factories["task_registry"] = blocking_factory
+
+    bootstrap = SchedulingIntegrationBootstrap(factories)
+
+    first = asyncio.create_task(bootstrap.bootstrap())
+    await factory_started.wait()
+
+    second = asyncio.create_task(bootstrap.bootstrap())
+    await asyncio.sleep(0)
+
+    second.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await second
+
+    assert bootstrap.state is BootstrapState.INITIALISING
+
+    allow_factory_to_finish.set()
+    await first
+
+    assert bootstrap.state is BootstrapState.READY
+
+
+@pytest.mark.asyncio
+async def test_close_rejects_during_initialisation(
+    components: dict[str, object],
+) -> None:
+    factory_started = asyncio.Event()
+    allow_factory_to_finish = asyncio.Event()
+
+    async def blocking_factory() -> object:
+        factory_started.set()
+        await allow_factory_to_finish.wait()
+        return components["task_registry"]
+
+    factories = make_factories(components)
+    factories["task_registry"] = blocking_factory
+
+    bootstrap = SchedulingIntegrationBootstrap(factories)
+
+    task = asyncio.create_task(bootstrap.bootstrap())
+    await factory_started.wait()
+
+    with pytest.raises(SchedulingBootstrapError):
+        bootstrap.close()
+
+    allow_factory_to_finish.set()
+    await task
+
     assert bootstrap.state is BootstrapState.READY
 
 
