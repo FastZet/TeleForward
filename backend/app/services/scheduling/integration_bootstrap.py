@@ -9,6 +9,7 @@ import logging
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
+from types import MappingProxyType
 from typing import Any
 
 
@@ -58,9 +59,8 @@ class SchedulingIntegrationBootstrap:
     Concurrent bootstrap calls are serialised. Successful concurrent
     callers reuse the same integration context.
 
-    Cleanup callbacks are explicitly supplied by the application.
-    They are executed in reverse component-construction order after
-    bootstrap failure, cancellation, or explicit asynchronous close.
+    Cleanup callbacks execute in reverse construction order after
+    bootstrap failure, cancellation, or asynchronous closure.
 
     The bootstrap does not start the scheduler.
     """
@@ -186,9 +186,7 @@ class SchedulingIntegrationBootstrap:
 
     @property
     def components(self) -> Mapping[str, Any]:
-        """Return a read-only view of constructed components."""
-        from types import MappingProxyType
-
+        """Return a read-only snapshot of constructed components."""
         return MappingProxyType(dict(self._components))
 
     async def _invoke_cleanup(
@@ -210,14 +208,24 @@ class SchedulingIntegrationBootstrap:
         self,
         components: Mapping[str, Any],
     ) -> list[str]:
-        """Clean up components in reverse construction order."""
+        """Attempt cleanup for every component in reverse order."""
         errors: list[str] = []
 
         for name, component in reversed(tuple(components.items())):
             try:
                 await self._invoke_cleanup(name, component)
+
             except asyncio.CancelledError:
-                raise
+                message = (
+                    f"{name}: cleanup callback was cancelled"
+                )
+                errors.append(message)
+
+                logger.error(
+                    "Cleanup callback was cancelled for %s",
+                    name,
+                )
+
             except Exception as exc:
                 message = f"{name}: {exc}"
                 errors.append(message)
@@ -229,9 +237,64 @@ class SchedulingIntegrationBootstrap:
 
         return errors
 
-    async def _build_components(self) -> dict[str, Any]:
-        components: dict[str, Any] = {}
+    async def _cleanup_resiliently(
+        self,
+        components: Mapping[str, Any],
+    ) -> tuple[list[str], bool]:
+        """Finish cleanup despite cancellation of the calling task.
 
+        Returns:
+            A tuple containing cleanup errors and whether cancellation
+            was received while cleanup was running.
+        """
+        cleanup_task = asyncio.create_task(
+            self._cleanup_components(components),
+            name="scheduling-bootstrap-cleanup",
+        )
+
+        cancellation_received = False
+
+        while not cleanup_task.done():
+            try:
+                await asyncio.shield(cleanup_task)
+
+            except asyncio.CancelledError:
+                cancellation_received = True
+
+                logger.warning(
+                    "Deferring cancellation until scheduling cleanup "
+                    "has completed"
+                )
+
+            except Exception:
+                # _cleanup_components normally collects individual
+                # callback errors. This protects against unexpected
+                # failures in the cleanup coordinator itself.
+                break
+
+        if cleanup_task.cancelled():
+            return (
+                ["cleanup coordinator was cancelled"],
+                cancellation_received,
+            )
+
+        try:
+            errors = cleanup_task.result()
+        except Exception as exc:
+            errors = [f"cleanup coordinator failed: {exc}"]
+
+        return errors, cancellation_received
+
+    async def _build_components(
+        self,
+        components: dict[str, Any],
+    ) -> None:
+        """Construct components directly into the shared tracking map.
+
+        Mutating the supplied map is essential: if a later factory
+        raises or is cancelled, previously constructed components
+        remain available for cleanup.
+        """
         for name in (
             *self.REQUIRED_COMPONENTS,
             *self.OPTIONAL_COMPONENTS,
@@ -252,8 +315,6 @@ class SchedulingIntegrationBootstrap:
                 )
 
             components[name] = component
-
-        return components
 
     def _record_failure(
         self,
@@ -299,7 +360,7 @@ class SchedulingIntegrationBootstrap:
         components: dict[str, Any] = {}
 
         try:
-            components = await self._build_components()
+            await self._build_components(components)
 
             context = SchedulingIntegrationContext.create(
                 scheduler_manager=components["scheduler_manager"],
@@ -331,9 +392,10 @@ class SchedulingIntegrationBootstrap:
             return self._report
 
         except asyncio.CancelledError as exc:
-            cleanup_errors = await self._cleanup_components(
+            cleanup_errors, _ = await self._cleanup_resiliently(
                 components
             )
+
             self._record_failure(exc, cleanup_errors)
 
             logger.warning(
@@ -342,10 +404,17 @@ class SchedulingIntegrationBootstrap:
             raise
 
         except Exception as exc:
-            cleanup_errors = await self._cleanup_components(
-                components
+            cleanup_errors, cancellation_received = (
+                await self._cleanup_resiliently(components)
             )
+
             self._record_failure(exc, cleanup_errors)
+
+            if cancellation_received:
+                logger.warning(
+                    "Cancellation was received during failure cleanup; "
+                    "preserving the original bootstrap exception"
+                )
 
             logger.exception(
                 "Scheduling integration bootstrap failed"
@@ -356,9 +425,10 @@ class SchedulingIntegrationBootstrap:
             ) from exc
 
         except BaseException as exc:
-            cleanup_errors = await self._cleanup_components(
+            cleanup_errors, _ = await self._cleanup_resiliently(
                 components
             )
+
             self._record_failure(exc, cleanup_errors)
             raise
 
@@ -370,8 +440,8 @@ class SchedulingIntegrationBootstrap:
     async def aclose(self) -> None:
         """Clean up constructed components and close the bootstrap.
 
-        Cleanup callbacks run in reverse construction order. A cleanup
-        failure does not prevent later callbacks from being attempted.
+        Cancellation received during cleanup is deferred until all
+        cleanup callbacks have been attempted and the state is CLOSED.
         """
         async with self._bootstrap_lock:
             if self._state is BootstrapState.CLOSED:
@@ -382,8 +452,10 @@ class SchedulingIntegrationBootstrap:
                     "Cannot close bootstrap during initialisation"
                 )
 
-            cleanup_errors = await self._cleanup_components(
-                self._components
+            components = dict(self._components)
+
+            cleanup_errors, cancellation_received = (
+                await self._cleanup_resiliently(components)
             )
 
             self._components = {}
@@ -401,6 +473,9 @@ class SchedulingIntegrationBootstrap:
                 ),
             )
 
+            if cancellation_received:
+                raise asyncio.CancelledError
+
             if cleanup_errors:
                 raise SchedulingBootstrapError(
                     "Bootstrap closed with cleanup failures: "
@@ -415,8 +490,6 @@ class SchedulingIntegrationBootstrap:
         """Release bootstrap references without running cleanup callbacks.
 
         Use aclose() when constructed resources must be released.
-        This synchronous method is retained for compatibility with
-        callers that only need to discard the bootstrap references.
         """
         if self._state is BootstrapState.INITIALISING:
             raise SchedulingBootstrapError(
