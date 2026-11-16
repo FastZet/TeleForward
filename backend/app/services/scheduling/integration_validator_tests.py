@@ -5,6 +5,11 @@ from __future__ import annotations
 
 import pytest
 
+from app.services.scheduling.integration_contracts import (
+    DEFAULT_SCHEDULING_CONTRACTS,
+    InterfaceContract,
+    SCHEDULER_MANAGER_CONTRACT,
+)
 from app.services.scheduling.integration_validator import (
     ComponentRequirement,
     IntegrationValidationReport,
@@ -128,7 +133,23 @@ def valid_components() -> dict[str, object]:
     }
 
 
-def test_default_requirements_validate_successfully(
+def test_default_requirements_come_from_central_contracts() -> None:
+    requirements = SchedulingIntegrationValidator.DEFAULT_REQUIREMENTS
+
+    assert len(requirements) == len(DEFAULT_SCHEDULING_CONTRACTS)
+
+    for contract in DEFAULT_SCHEDULING_CONTRACTS:
+        requirement = next(
+            item
+            for item in requirements
+            if item.component == contract.name
+        )
+
+        assert requirement.methods == contract.required_methods
+        assert requirement.attributes == contract.required_attributes
+
+
+def test_default_contracts_validate_successfully(
     validator: SchedulingIntegrationValidator,
     valid_components: dict[str, object],
 ) -> None:
@@ -274,7 +295,7 @@ def test_validate_or_raise_rejects_invalid_components(
     assert "integration validation failed" in str(error.value).lower()
 
 
-def test_custom_requirements_are_supported() -> None:
+def test_custom_component_requirements_remain_supported() -> None:
     custom_validator = SchedulingIntegrationValidator(
         requirements=(
             ComponentRequirement(
@@ -302,26 +323,39 @@ def test_custom_requirements_are_supported() -> None:
     assert report.components_checked == 1
 
 
-def test_custom_requirements_report_missing_interfaces() -> None:
-    custom_validator = SchedulingIntegrationValidator(
-        requirements=(
-            ComponentRequirement(
-                component="custom_worker",
-                methods=("execute",),
-                attributes=("worker_id",),
-            ),
+def test_central_interface_contract_can_be_used_directly() -> None:
+    validator = SchedulingIntegrationValidator(
+        requirements=(SCHEDULER_MANAGER_CONTRACT,)
+    )
+
+    report = validator.validate(
+        {"scheduler_manager": FakeSchedulerManager()}
+    )
+
+    assert report.valid is True
+    assert report.components_checked == 1
+
+
+def test_multiple_interface_contracts_can_be_combined() -> None:
+    validator = SchedulingIntegrationValidator(
+        requirements=DEFAULT_SCHEDULING_CONTRACTS
+    )
+
+    components = {
+        "scheduler_manager": FakeSchedulerManager(),
+        "task_registry": FakeTaskRegistry(),
+        "job_store": FakeJobStore(),
+        "scheduler": FakeScheduler(),
+    }
+
+    assert validator.validate(components).valid is True
+
+
+def test_invalid_requirement_type_is_rejected() -> None:
+    with pytest.raises(TypeError):
+        SchedulingIntegrationValidator(
+            requirements=(object(),)  # type: ignore[arg-type]
         )
-    )
-
-    report = custom_validator.validate(
-        {"custom_worker": object()}
-    )
-
-    assert report.valid is False
-    assert report.errors == (
-        "custom_worker: missing methods: execute",
-        "custom_worker: missing attributes: worker_id",
-    )
 
 
 def test_empty_requirements_are_rejected() -> None:
@@ -406,3 +440,23 @@ def test_report_counts_are_consistent(
     )
     assert report.components_invalid == 1
     assert report.valid is False
+
+
+def test_custom_contract_with_missing_interface_is_reported() -> None:
+    contract = InterfaceContract(
+        name="custom_worker",
+        required_methods=("execute",),
+        required_attributes=("worker_id",),
+    )
+
+    validator = SchedulingIntegrationValidator(
+        requirements=(contract,)
+    )
+
+    report = validator.validate({"custom_worker": object()})
+
+    assert report.valid is False
+    assert report.errors == (
+        "custom_worker: missing methods: execute",
+        "custom_worker: missing attributes: worker_id",
+    )
