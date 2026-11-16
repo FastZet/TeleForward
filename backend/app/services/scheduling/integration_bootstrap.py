@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import logging
 from collections.abc import Awaitable, Callable, Mapping
@@ -12,7 +13,6 @@ from typing import Any
 
 from app.services.scheduling.integration_context import (
     SchedulingIntegrationContext,
-    SchedulingIntegrationContextError,
 )
 from app.services.scheduling.integration_validator import (
     IntegrationValidationReport,
@@ -52,6 +52,9 @@ ComponentFactory = Callable[[], Any | Awaitable[Any]]
 
 class SchedulingIntegrationBootstrap:
     """Construct and validate scheduling components.
+
+    Concurrent bootstrap calls are serialised. Calls made while another
+    bootstrap is running wait for it to finish and reuse its result.
 
     The bootstrap does not start the scheduler. Scheduler activation
     remains the responsibility of SchedulerLifecycle.
@@ -126,6 +129,8 @@ class SchedulingIntegrationBootstrap:
         self._context: SchedulingIntegrationContext | None = None
         self._report: BootstrapReport | None = None
 
+        self._bootstrap_lock = asyncio.Lock()
+
     @property
     def state(self) -> BootstrapState:
         return self._state
@@ -169,15 +174,14 @@ class SchedulingIntegrationBootstrap:
 
         return components
 
-    async def bootstrap(self) -> BootstrapReport:
-        """Build components and create a validated integration context."""
+    async def _bootstrap_locked(self) -> BootstrapReport:
+        """Perform bootstrap while holding the bootstrap lock."""
         if self._state is BootstrapState.READY:
-            return self._report  # type: ignore[return-value]
-
-        if self._state is BootstrapState.INITIALISING:
-            raise SchedulingBootstrapError(
-                "Scheduling bootstrap is already running"
-            )
+            if self._report is None:
+                raise SchedulingBootstrapError(
+                    "Bootstrap is READY without a result report"
+                )
+            return self._report
 
         if self._state is BootstrapState.CLOSED:
             raise SchedulingBootstrapError(
@@ -186,6 +190,7 @@ class SchedulingIntegrationBootstrap:
 
         self._state = BootstrapState.INITIALISING
         self._context = None
+        self._report = None
 
         try:
             components = await self._build_components()
@@ -218,6 +223,21 @@ class SchedulingIntegrationBootstrap:
 
             return self._report
 
+        except asyncio.CancelledError as exc:
+            self._state = BootstrapState.FAILED
+            self._context = None
+            self._report = BootstrapReport(
+                state=BootstrapState.FAILED,
+                context_created=False,
+                validation_report=None,
+                error="Bootstrap was cancelled",
+            )
+
+            logger.warning(
+                "Scheduling integration bootstrap was cancelled"
+            )
+            raise
+
         except Exception as exc:
             self._state = BootstrapState.FAILED
             self._context = None
@@ -236,6 +256,15 @@ class SchedulingIntegrationBootstrap:
             raise SchedulingBootstrapError(
                 "Failed to bootstrap scheduling integration"
             ) from exc
+
+    async def bootstrap(self) -> BootstrapReport:
+        """Build components and create a validated integration context.
+
+        Concurrent callers are serialised. After the first successful
+        caller completes, subsequent callers receive the same report.
+        """
+        async with self._bootstrap_lock:
+            return await self._bootstrap_locked()
 
     def close(self) -> None:
         """Close the bootstrap and release its context reference.
