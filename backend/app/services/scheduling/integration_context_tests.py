@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+
 import pytest
 
 from app.services.scheduling.integration_context import (
@@ -10,6 +12,7 @@ from app.services.scheduling.integration_context import (
     SchedulingIntegrationContextError,
 )
 from app.services.scheduling.integration_validator import (
+    SchedulingIntegrationError,
     SchedulingIntegrationValidator,
 )
 
@@ -178,24 +181,43 @@ def test_context_rejects_different_scheduler_instance(
         )
 
 
-def test_context_exposes_adapted_components(
+def test_context_exposes_all_adapted_components(
     components: dict[str, object],
 ) -> None:
     context = create_context(components)
 
-    adapted = context.components
-
-    assert set(adapted) == {
+    assert set(context.components) == {
         "scheduler_manager",
         "task_registry",
         "job_store",
         "scheduler",
     }
 
-    assert all(
-        hasattr(component, "component")
-        for component in adapted.values()
-    )
+
+def test_components_mapping_is_read_only(
+    components: dict[str, object],
+) -> None:
+    context = create_context(components)
+
+    assert isinstance(context.components, Mapping)
+
+    with pytest.raises(TypeError):
+        context.components["new_component"] = object()  # type: ignore[index]
+
+    with pytest.raises(TypeError):
+        del context.components["scheduler"]  # type: ignore[attr-defined]
+
+
+def test_components_property_returns_fresh_mapping(
+    components: dict[str, object],
+) -> None:
+    context = create_context(components)
+
+    first = context.components
+    second = context.components
+
+    assert first is not second
+    assert first == second
 
 
 def test_get_component_returns_canonical_adapter(
@@ -235,44 +257,32 @@ def test_unknown_component_raises_key_error(
         context.get_component("unknown")
 
 
-def test_context_rejects_invalid_manager(
+@pytest.mark.parametrize(
+    "component_name",
+    [
+        "scheduler_manager",
+        "task_registry",
+        "job_store",
+    ],
+)
+def test_context_rejects_invalid_components(
     components: dict[str, object],
+    component_name: str,
 ) -> None:
+    supplied = dict(components)
+    supplied[component_name] = object()
+
     with pytest.raises(SchedulingIntegrationContextError):
         SchedulingIntegrationContext.create(
-            scheduler_manager=object(),
-            task_registry=components["task_registry"],
-            job_store=components["job_store"],
-        )
-
-
-def test_context_rejects_invalid_registry(
-    components: dict[str, object],
-) -> None:
-    with pytest.raises(SchedulingIntegrationContextError):
-        SchedulingIntegrationContext.create(
-            scheduler_manager=components["scheduler_manager"],
-            task_registry=object(),
-            job_store=components["job_store"],
-        )
-
-
-def test_context_rejects_invalid_job_store(
-    components: dict[str, object],
-) -> None:
-    with pytest.raises(SchedulingIntegrationContextError):
-        SchedulingIntegrationContext.create(
-            scheduler_manager=components["scheduler_manager"],
-            task_registry=components["task_registry"],
-            job_store=object(),
+            scheduler_manager=supplied["scheduler_manager"],
+            task_registry=supplied["task_registry"],
+            job_store=supplied["job_store"],
         )
 
 
 def test_context_rejects_invalid_scheduler(
     components: dict[str, object],
 ) -> None:
-    manager = components["scheduler_manager"]
-
     class ManagerWithoutScheduler:
         def create_job(self) -> None:
             pass
@@ -308,8 +318,6 @@ def test_context_rejects_invalid_scheduler(
             job_store=components["job_store"],
         )
 
-    assert manager is not None
-
 
 def test_context_supports_custom_method_aliases() -> None:
     scheduler = FakeScheduler()
@@ -340,9 +348,7 @@ def test_context_supports_custom_method_aliases() -> None:
         scheduler_manager=FakeSchedulerManager(scheduler),
         task_registry=LegacyRegistry(),
         job_store=FakeJobStore(),
-        registry_method_aliases={
-            "register": "add_task",
-        },
+        registry_method_aliases={"register": "add_task"},
     )
 
     assert context.task_registry.register() is None
@@ -385,22 +391,18 @@ def test_context_supports_manager_attribute_aliases() -> None:
         scheduler_manager=LegacyManager(),
         task_registry=FakeTaskRegistry(),
         job_store=FakeJobStore(),
-        manager_attribute_aliases={
-            "scheduler": "engine",
-        },
+        manager_attribute_aliases={"scheduler": "engine"},
     )
 
     assert context.scheduler.component is scheduler
 
 
-def test_context_does_not_start_scheduler(
+def test_context_creation_does_not_start_scheduler(
     components: dict[str, object],
 ) -> None:
-    scheduler = components["scheduler"]
     context = create_context(components)
 
     assert context.is_validated is True
-    assert scheduler is components["scheduler"]
 
 
 def test_context_revalidates_components(
@@ -414,15 +416,14 @@ def test_context_revalidates_components(
     assert report.components_checked == 4
 
 
-def test_context_revalidation_detects_removed_method(
+def test_revalidation_detects_removed_method(
     components: dict[str, object],
 ) -> None:
     context = create_context(components)
 
-    scheduler = components["scheduler"]
-    scheduler.add_job = None  # type: ignore[method-assign]
+    components["scheduler"].add_job = None  # type: ignore[method-assign]
 
-    with pytest.raises(Exception):
+    with pytest.raises(SchedulingIntegrationContextError):
         context.revalidate()
 
 
@@ -437,3 +438,54 @@ def test_custom_validator_can_be_supplied(
     )
 
     assert context.is_validated is True
+
+
+def test_invalid_validator_type_is_rejected(
+    components: dict[str, object],
+) -> None:
+    with pytest.raises(TypeError):
+        create_context(
+            components,
+            validator=object(),
+        )
+
+
+def test_revalidate_rejects_invalid_validator_type(
+    components: dict[str, object],
+) -> None:
+    context = create_context(components)
+
+    with pytest.raises(TypeError):
+        context.revalidate(object())  # type: ignore[arg-type]
+
+
+def test_validation_error_is_wrapped(
+    components: dict[str, object],
+) -> None:
+    class FailingValidator(SchedulingIntegrationValidator):
+        def validate_or_raise(self, components):
+            raise SchedulingIntegrationError("test validation failure")
+
+    with pytest.raises(
+        SchedulingIntegrationContextError
+    ) as error:
+        create_context(
+            components,
+            validator=FailingValidator(),
+        )
+
+    assert isinstance(error.value.__cause__, SchedulingIntegrationError)
+
+
+def test_unexpected_validator_error_is_not_wrapped(
+    components: dict[str, object],
+) -> None:
+    class BrokenValidator(SchedulingIntegrationValidator):
+        def validate_or_raise(self, components):
+            raise ValueError("unexpected validator failure")
+
+    with pytest.raises(ValueError, match="unexpected validator failure"):
+        create_context(
+            components,
+            validator=BrokenValidator(),
+        )
