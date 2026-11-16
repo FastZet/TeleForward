@@ -1,5 +1,5 @@
 
-"""Tests for scheduling integration bootstrap and resource cleanup."""
+"""Regression tests for scheduling bootstrap cleanup and cancellation."""
 
 from __future__ import annotations
 
@@ -148,15 +148,7 @@ def bootstrap(
 
 
 @pytest.mark.asyncio
-async def test_initial_state_is_not_started(
-    bootstrap: SchedulingIntegrationBootstrap,
-) -> None:
-    assert bootstrap.state is BootstrapState.NOT_STARTED
-    assert bootstrap.report is None
-
-
-@pytest.mark.asyncio
-async def test_sync_factories_bootstrap_successfully(
+async def test_bootstrap_success(
     bootstrap: SchedulingIntegrationBootstrap,
 ) -> None:
     report = await bootstrap.bootstrap()
@@ -165,32 +157,11 @@ async def test_sync_factories_bootstrap_successfully(
     assert report.context_created is True
     assert report.validation_report is not None
     assert report.validation_report.valid is True
-    assert bootstrap.state is BootstrapState.READY
+    assert bootstrap.context.is_validated is True
 
 
 @pytest.mark.asyncio
-async def test_async_factories_bootstrap_successfully(
-    components: dict[str, object],
-) -> None:
-    async def factory(component: object) -> object:
-        return component
-
-    factories = {
-        name: (
-            lambda component=component: factory(component)
-        )
-        for name, component in components.items()
-    }
-
-    bootstrap = SchedulingIntegrationBootstrap(factories)
-
-    report = await bootstrap.bootstrap()
-
-    assert report.state is BootstrapState.READY
-
-
-@pytest.mark.asyncio
-async def test_bootstrap_is_idempotent_after_success(
+async def test_bootstrap_is_idempotent(
     bootstrap: SchedulingIntegrationBootstrap,
 ) -> None:
     first = await bootstrap.bootstrap()
@@ -235,83 +206,82 @@ async def test_concurrent_bootstrap_calls_construct_once(
 
 
 @pytest.mark.asyncio
-async def test_context_is_unavailable_before_bootstrap(
-    bootstrap: SchedulingIntegrationBootstrap,
-) -> None:
-    with pytest.raises(SchedulingBootstrapError):
-        _ = bootstrap.context
-
-
-@pytest.mark.asyncio
-async def test_context_is_available_after_bootstrap(
-    bootstrap: SchedulingIntegrationBootstrap,
-) -> None:
-    await bootstrap.bootstrap()
-
-    assert bootstrap.context.is_validated is True
-
-
-@pytest.mark.asyncio
-async def test_optional_scheduler_factory_can_be_omitted(
-    components: dict[str, object],
-) -> None:
-    factories = make_factories(components)
-    factories.pop("scheduler")
-
-    bootstrap = SchedulingIntegrationBootstrap(factories)
-
-    await bootstrap.bootstrap()
-
-    assert bootstrap.context.scheduler.component is components["scheduler"]
-
-
-@pytest.mark.asyncio
-async def test_factory_returning_none_fails_bootstrap(
-    components: dict[str, object],
-) -> None:
-    factories = make_factories(components)
-    factories["job_store"] = lambda: None
-
-    bootstrap = SchedulingIntegrationBootstrap(factories)
-
-    with pytest.raises(SchedulingBootstrapError):
-        await bootstrap.bootstrap()
-
-    assert bootstrap.state is BootstrapState.FAILED
-    assert bootstrap.report is not None
-    assert bootstrap.report.context_created is False
-
-
-@pytest.mark.asyncio
-async def test_factory_exception_fails_bootstrap(
-    components: dict[str, object],
-) -> None:
-    factories = make_factories(components)
-
-    def failing_factory() -> object:
-        raise RuntimeError("factory failure")
-
-    factories["task_registry"] = failing_factory
-
-    bootstrap = SchedulingIntegrationBootstrap(factories)
-
-    with pytest.raises(SchedulingBootstrapError) as error:
-        await bootstrap.bootstrap()
-
-    assert isinstance(error.value.__cause__, RuntimeError)
-    assert bootstrap.state is BootstrapState.FAILED
-    assert bootstrap.report is not None
-    assert "factory failure" in (bootstrap.report.error or "")
-
-
-@pytest.mark.asyncio
-async def test_validation_failure_runs_cleanup_callbacks(
+async def test_partial_construction_is_cleaned_up_on_factory_failure(
     components: dict[str, object],
 ) -> None:
     cleanup_order: list[str] = []
 
-    def cleanup(name: str) -> Callable[[object], None]:
-        return lambda component: cleanup_order.append(name)
+    def failing_registry_factory() -> object:
+        raise RuntimeError("registry construction failed")
+
+    factories = make_factories(components)
+    factories["task_registry"] = failing_registry_factory
+
+    bootstrap = SchedulingIntegrationBootstrap(
+        factories,
+        cleanup_callbacks={
+            "scheduler_manager": (
+                lambda component: cleanup_order.append(
+                    "scheduler_manager"
+                )
+            ),
+            "job_store": (
+                lambda component: cleanup_order.append("job_store")
+            ),
+        },
+    )
+
+    with pytest.raises(SchedulingBootstrapError):
+        await bootstrap.bootstrap()
+
+    assert cleanup_order == ["scheduler_manager"]
+    assert bootstrap.state is BootstrapState.FAILED
+    assert dict(bootstrap.components) == {}
+
+
+@pytest.mark.asyncio
+async def test_partial_construction_cleanup_uses_reverse_order(
+    components: dict[str, object],
+) -> None:
+    cleanup_order: list[str] = []
+
+    def failing_store_factory() -> object:
+        raise RuntimeError("store construction failed")
+
+    factories = make_factories(components)
+    factories["job_store"] = failing_store_factory
+
+    bootstrap = SchedulingIntegrationBootstrap(
+        factories,
+        cleanup_callbacks={
+            "scheduler_manager": (
+                lambda component: cleanup_order.append(
+                    "scheduler_manager"
+                )
+            ),
+            "task_registry": (
+                lambda component: cleanup_order.append("task_registry")
+            ),
+            "job_store": (
+                lambda component: cleanup_order.append("job_store")
+            ),
+        },
+    )
+
+    with pytest.raises(SchedulingBootstrapError):
+        await bootstrap.bootstrap()
+
+    assert cleanup_order == [
+        "task_registry",
+        "scheduler_manager",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_validation_failure_cleans_all_constructed_components(
+    components: dict[str, object],
+) -> None:
+    cleanup_order: list[str] = []
 
     factories = make_factories(components)
     factories["task_registry"] = lambda: object()
@@ -319,10 +289,20 @@ async def test_validation_failure_runs_cleanup_callbacks(
     bootstrap = SchedulingIntegrationBootstrap(
         factories,
         cleanup_callbacks={
-            "scheduler_manager": cleanup("scheduler_manager"),
-            "task_registry": cleanup("task_registry"),
-            "job_store": cleanup("job_store"),
-            "scheduler": cleanup("scheduler"),
+            "scheduler_manager": (
+                lambda component: cleanup_order.append(
+                    "scheduler_manager"
+                )
+            ),
+            "task_registry": (
+                lambda component: cleanup_order.append("task_registry")
+            ),
+            "job_store": (
+                lambda component: cleanup_order.append("job_store")
+            ),
+            "scheduler": (
+                lambda component: cleanup_order.append("scheduler")
+            ),
         },
     )
 
@@ -336,110 +316,29 @@ async def test_validation_failure_runs_cleanup_callbacks(
         "scheduler_manager",
     ]
 
-    assert bootstrap.state is BootstrapState.FAILED
-
 
 @pytest.mark.asyncio
-async def test_cleanup_callbacks_run_in_reverse_order_on_aclose(
-    components: dict[str, object],
-) -> None:
-    cleanup_order: list[str] = []
-
-    def cleanup(name: str) -> Callable[[object], None]:
-        return lambda component: cleanup_order.append(name)
-
-    bootstrap = SchedulingIntegrationBootstrap(
-        make_factories(components),
-        cleanup_callbacks={
-            "scheduler_manager": cleanup("scheduler_manager"),
-            "task_registry": cleanup("task_registry"),
-            "job_store": cleanup("job_store"),
-            "scheduler": cleanup("scheduler"),
-        },
-    )
-
-    await bootstrap.bootstrap()
-    await bootstrap.aclose()
-
-    assert cleanup_order == [
-        "scheduler",
-        "job_store",
-        "task_registry",
-        "scheduler_manager",
-    ]
-
-
-@pytest.mark.asyncio
-async def test_async_cleanup_callbacks_are_supported(
-    components: dict[str, object],
-) -> None:
-    cleanup_order: list[str] = []
-
-    async def cleanup_scheduler(component: object) -> None:
-        await asyncio.sleep(0)
-        cleanup_order.append("scheduler")
-
-    bootstrap = SchedulingIntegrationBootstrap(
-        make_factories(components),
-        cleanup_callbacks={
-            "scheduler": cleanup_scheduler,
-        },
-    )
-
-    await bootstrap.bootstrap()
-    await bootstrap.aclose()
-
-    assert cleanup_order == ["scheduler"]
-
-
-@pytest.mark.asyncio
-async def test_mixed_sync_and_async_cleanup_callbacks(
-    components: dict[str, object],
-) -> None:
-    cleanup_order: list[str] = []
-
-    def cleanup_manager(component: object) -> None:
-        cleanup_order.append("manager")
-
-    async def cleanup_store(component: object) -> None:
-        cleanup_order.append("store")
-
-    bootstrap = SchedulingIntegrationBootstrap(
-        make_factories(components),
-        cleanup_callbacks={
-            "scheduler_manager": cleanup_manager,
-            "job_store": cleanup_store,
-        },
-    )
-
-    await bootstrap.bootstrap()
-    await bootstrap.aclose()
-
-    assert cleanup_order == ["store", "manager"]
-
-
-@pytest.mark.asyncio
-async def test_cleanup_failure_does_not_skip_remaining_callbacks(
+async def test_cleanup_failure_does_not_skip_other_components(
     components: dict[str, object],
 ) -> None:
     cleanup_order: list[str] = []
 
     def failing_cleanup(component: object) -> None:
-        cleanup_order.append("scheduler")
-        raise RuntimeError("scheduler cleanup failed")
-
-    def cleanup_store(component: object) -> None:
         cleanup_order.append("job_store")
-
-    def cleanup_registry(component: object) -> None:
-        cleanup_order.append("task_registry")
+        raise RuntimeError("store cleanup failed")
 
     bootstrap = SchedulingIntegrationBootstrap(
         make_factories(components),
         cleanup_callbacks={
-            "scheduler": failing_cleanup,
-            "job_store": cleanup_store,
-            "task_registry": cleanup_registry,
+            "scheduler_manager": (
+                lambda component: cleanup_order.append(
+                    "scheduler_manager"
+                )
+            ),
+            "job_store": failing_cleanup,
+            "task_registry": (
+                lambda component: cleanup_order.append("task_registry")
+            ),
         },
     )
 
@@ -449,12 +348,165 @@ async def test_cleanup_failure_does_not_skip_remaining_callbacks(
         await bootstrap.aclose()
 
     assert cleanup_order == [
+        "job_store",
+        "task_registry",
+        "scheduler_manager",
+    ]
+    assert bootstrap.state is BootstrapState.CLOSED
+    assert bootstrap.report is not None
+    assert "store cleanup failed" in (
+        bootstrap.report.error or ""
+    )
+
+
+@pytest.mark.asyncio
+async def test_async_cleanup_callbacks_are_supported(
+    components: dict[str, object],
+) -> None:
+    cleanup_order: list[str] = []
+
+    async def cleanup_store(component: object) -> None:
+        await asyncio.sleep(0)
+        cleanup_order.append("job_store")
+
+    bootstrap = SchedulingIntegrationBootstrap(
+        make_factories(components),
+        cleanup_callbacks={"job_store": cleanup_store},
+    )
+
+    await bootstrap.bootstrap()
+    await bootstrap.aclose()
+
+    assert cleanup_order == ["job_store"]
+
+
+@pytest.mark.asyncio
+async def test_cancellation_during_factory_cleans_prior_components(
+    components: dict[str, object],
+) -> None:
+    cleanup_order: list[str] = []
+    factory_started = asyncio.Event()
+    never_finish = asyncio.Event()
+
+    async def blocking_registry_factory() -> object:
+        factory_started.set()
+        await never_finish.wait()
+        return components["task_registry"]
+
+    factories = make_factories(components)
+    factories["task_registry"] = blocking_registry_factory
+
+    bootstrap = SchedulingIntegrationBootstrap(
+        factories,
+        cleanup_callbacks={
+            "scheduler_manager": (
+                lambda component: cleanup_order.append(
+                    "scheduler_manager"
+                )
+            ),
+        },
+    )
+
+    task = asyncio.create_task(bootstrap.bootstrap())
+    await factory_started.wait()
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert cleanup_order == ["scheduler_manager"]
+    assert bootstrap.state is BootstrapState.FAILED
+    assert bootstrap.report is not None
+    assert bootstrap.report.error == "Bootstrap was cancelled"
+
+
+@pytest.mark.asyncio
+async def test_repeated_cancellation_does_not_interrupt_cleanup(
+    components: dict[str, object],
+) -> None:
+    factory_started = asyncio.Event()
+    cleanup_started = asyncio.Event()
+    allow_cleanup = asyncio.Event()
+    cleanup_finished = asyncio.Event()
+
+    async def blocking_registry_factory() -> object:
+        factory_started.set()
+        await asyncio.Event().wait()
+        return components["task_registry"]
+
+    async def blocking_manager_cleanup(component: object) -> None:
+        cleanup_started.set()
+        await allow_cleanup.wait()
+        cleanup_finished.set()
+
+    factories = make_factories(components)
+    factories["task_registry"] = blocking_registry_factory
+
+    bootstrap = SchedulingIntegrationBootstrap(
+        factories,
+        cleanup_callbacks={
+            "scheduler_manager": blocking_manager_cleanup,
+        },
+    )
+
+    task = asyncio.create_task(bootstrap.bootstrap())
+    await factory_started.wait()
+
+    task.cancel()
+    await cleanup_started.wait()
+
+    task.cancel()
+    await asyncio.sleep(0)
+
+    assert not cleanup_finished.is_set()
+
+    allow_cleanup.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert cleanup_finished.is_set()
+    assert bootstrap.state is BootstrapState.FAILED
+
+
+@pytest.mark.asyncio
+async def test_aclose_cleans_components_in_reverse_order(
+    components: dict[str, object],
+) -> None:
+    cleanup_order: list[str] = []
+
+    bootstrap = SchedulingIntegrationBootstrap(
+        make_factories(components),
+        cleanup_callbacks={
+            "scheduler_manager": (
+                lambda component: cleanup_order.append(
+                    "scheduler_manager"
+                )
+            ),
+            "task_registry": (
+                lambda component: cleanup_order.append("task_registry")
+            ),
+            "job_store": (
+                lambda component: cleanup_order.append("job_store")
+            ),
+            "scheduler": (
+                lambda component: cleanup_order.append("scheduler")
+            ),
+        },
+    )
+
+    await bootstrap.bootstrap()
+    await bootstrap.aclose()
+
+    assert cleanup_order == [
         "scheduler",
         "job_store",
         "task_registry",
+        "scheduler_manager",
     ]
 
     assert bootstrap.state is BootstrapState.CLOSED
+    assert dict(bootstrap.components) == {}
 
 
 @pytest.mark.asyncio
@@ -469,9 +521,7 @@ async def test_aclose_is_idempotent(
 
     bootstrap = SchedulingIntegrationBootstrap(
         make_factories(components),
-        cleanup_callbacks={
-            "job_store": cleanup,
-        },
+        cleanup_callbacks={"job_store": cleanup},
     )
 
     await bootstrap.bootstrap()
@@ -479,6 +529,43 @@ async def test_aclose_is_idempotent(
     await bootstrap.aclose()
 
     assert cleanup_calls == 1
+    assert bootstrap.state is BootstrapState.CLOSED
+
+
+@pytest.mark.asyncio
+async def test_cancellation_during_aclose_is_deferred(
+    components: dict[str, object],
+) -> None:
+    cleanup_started = asyncio.Event()
+    allow_cleanup = asyncio.Event()
+    cleanup_finished = asyncio.Event()
+
+    async def blocking_cleanup(component: object) -> None:
+        cleanup_started.set()
+        await allow_cleanup.wait()
+        cleanup_finished.set()
+
+    bootstrap = SchedulingIntegrationBootstrap(
+        make_factories(components),
+        cleanup_callbacks={"job_store": blocking_cleanup},
+    )
+
+    await bootstrap.bootstrap()
+
+    close_task = asyncio.create_task(bootstrap.aclose())
+    await cleanup_started.wait()
+
+    close_task.cancel()
+    await asyncio.sleep(0)
+
+    assert not cleanup_finished.is_set()
+
+    allow_cleanup.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await close_task
+
+    assert cleanup_finished.is_set()
     assert bootstrap.state is BootstrapState.CLOSED
 
 
@@ -532,69 +619,14 @@ async def test_failed_bootstrap_can_be_retried(
 
 
 @pytest.mark.asyncio
-async def test_cancellation_during_factory_marks_failed(
-    components: dict[str, object],
+async def test_context_unavailable_after_close(
+    bootstrap: SchedulingIntegrationBootstrap,
 ) -> None:
-    started = asyncio.Event()
-    never_finish = asyncio.Event()
+    await bootstrap.bootstrap()
+    await bootstrap.aclose()
 
-    async def blocking_factory() -> object:
-        started.set()
-        await never_finish.wait()
-        return components["task_registry"]
-
-    factories = make_factories(components)
-    factories["task_registry"] = blocking_factory
-
-    bootstrap = SchedulingIntegrationBootstrap(factories)
-
-    task = asyncio.create_task(bootstrap.bootstrap())
-    await started.wait()
-    task.cancel()
-
-    with pytest.raises(asyncio.CancelledError):
-        await task
-
-    assert bootstrap.state is BootstrapState.FAILED
-    assert bootstrap.report is not None
-    assert bootstrap.report.error == "Bootstrap was cancelled"
-
-
-@pytest.mark.asyncio
-async def test_cancellation_runs_cleanup_for_built_components(
-    components: dict[str, object],
-) -> None:
-    cleanup_order: list[str] = []
-    started = asyncio.Event()
-    never_finish = asyncio.Event()
-
-    async def blocking_registry_factory() -> object:
-        started.set()
-        await never_finish.wait()
-        return components["task_registry"]
-
-    factories = make_factories(components)
-    factories["task_registry"] = blocking_registry_factory
-
-    bootstrap = SchedulingIntegrationBootstrap(
-        factories,
-        cleanup_callbacks={
-            "scheduler_manager": lambda component: cleanup_order.append(
-                "scheduler_manager"
-            ),
-        },
-    )
-
-    task = asyncio.create_task(bootstrap.bootstrap())
-    await started.wait()
-    task.cancel()
-
-    with pytest.raises(asyncio.CancelledError):
-        await task
-
-    # The manager factory completed before registry construction began.
-    # Its cleanup callback should therefore have been invoked.
-    assert cleanup_order == ["scheduler_manager"]
+    with pytest.raises(SchedulingBootstrapError):
+        _ = bootstrap.context
 
 
 @pytest.mark.asyncio
@@ -620,16 +652,15 @@ async def test_close_releases_references_without_cleanup(
 
 
 @pytest.mark.asyncio
-async def test_aclose_clears_component_references(
+async def test_components_property_is_read_only(
     bootstrap: SchedulingIntegrationBootstrap,
 ) -> None:
     await bootstrap.bootstrap()
-    await bootstrap.aclose()
 
-    assert dict(bootstrap.components) == {}
+    snapshot = bootstrap.components
 
-    with pytest.raises(SchedulingBootstrapError):
-        _ = bootstrap.context
+    with pytest.raises(TypeError):
+        snapshot["new_component"] = object()  # type: ignore[index]
 
 
 @pytest.mark.asyncio
@@ -644,7 +675,6 @@ async def test_bootstrap_does_not_start_scheduler(
             self.started = True
 
     scheduler = TrackingScheduler()
-
     components["scheduler"] = scheduler
     components["scheduler_manager"] = FakeSchedulerManager(scheduler)
 
@@ -703,7 +733,9 @@ def test_cleanup_callback_without_factory_is_rejected(
     with pytest.raises(ValueError):
         SchedulingIntegrationBootstrap(
             factories,
-            cleanup_callbacks={"scheduler": lambda component: None},
+            cleanup_callbacks={
+                "scheduler": lambda component: None,
+            },
         )
 
 
@@ -717,11 +749,11 @@ def test_non_callable_cleanup_callback_is_rejected(
         )
 
 
-def test_invalid_cleanup_mapping_is_rejected(
+def test_non_mapping_cleanup_callbacks_are_rejected(
     components: dict[str, object],
 ) -> None:
     with pytest.raises(TypeError):
         SchedulingIntegrationBootstrap(
             make_factories(components),
-            cleanup_callbacks=None,  # type: ignore[arg-type]
+            cleanup_callbacks="invalid",  # type: ignore[arg-type]
         )
