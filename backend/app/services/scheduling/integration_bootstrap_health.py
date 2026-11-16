@@ -39,23 +39,49 @@ class BootstrapHealthReport:
     details: tuple[str, ...]
 
     def __post_init__(self) -> None:
+        if not isinstance(self.status, BootstrapHealthStatus):
+            raise TypeError("status must be a BootstrapHealthStatus")
+
+        if not isinstance(self.bootstrap_state, BootstrapState):
+            raise TypeError("bootstrap_state must be a BootstrapState")
+
+        if not isinstance(self.context_available, bool):
+            raise TypeError("context_available must be a bool")
+
+        if not isinstance(self.required_components_available, bool):
+            raise TypeError(
+                "required_components_available must be a bool"
+            )
+
+        if self.validation_passed is not None and not isinstance(
+            self.validation_passed,
+            bool,
+        ):
+            raise TypeError(
+                "validation_passed must be a bool or None"
+            )
+
         if self.checked_at.tzinfo is None:
             raise ValueError("checked_at must be timezone-aware")
 
         if self.checked_at.utcoffset() is None:
             raise ValueError("checked_at must have a UTC offset")
 
-        if not isinstance(self.available_components, tuple):
-            raise TypeError("available_components must be a tuple")
+        for field_name in (
+            "available_components",
+            "missing_components",
+            "cleanup_failures",
+            "details",
+        ):
+            value = getattr(self, field_name)
 
-        if not isinstance(self.missing_components, tuple):
-            raise TypeError("missing_components must be a tuple")
+            if not isinstance(value, tuple):
+                raise TypeError(f"{field_name} must be a tuple")
 
-        if not isinstance(self.cleanup_failures, tuple):
-            raise TypeError("cleanup_failures must be a tuple")
-
-        if not isinstance(self.details, tuple):
-            raise TypeError("details must be a tuple")
+            if any(not isinstance(item, str) for item in value):
+                raise TypeError(
+                    f"{field_name} must contain only strings"
+                )
 
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-compatible health representation."""
@@ -88,6 +114,15 @@ class SchedulingBootstrapHealthService:
         self,
         bootstrap: SchedulingIntegrationBootstrap | None = None,
     ) -> None:
+        if bootstrap is not None and not isinstance(
+            bootstrap,
+            SchedulingIntegrationBootstrap,
+        ):
+            raise TypeError(
+                "bootstrap must be a SchedulingIntegrationBootstrap "
+                "or None"
+            )
+
         self._bootstrap = bootstrap
 
     @property
@@ -113,27 +148,6 @@ class SchedulingBootstrapHealthService:
             )
 
         self._bootstrap = bootstrap
-
-    @staticmethod
-    def _extract_cleanup_failures(
-        error: str | None,
-    ) -> tuple[str, ...]:
-        """Extract cleanup failure details from the bootstrap report."""
-        if not error or "cleanup failures: " not in error:
-            return ()
-
-        _, separator, remainder = error.partition(
-            "cleanup failures: "
-        )
-
-        if not separator:
-            return ()
-
-        return tuple(
-            item.strip()
-            for item in remainder.split(";")
-            if item.strip()
-        )
 
     @staticmethod
     def _get_validation_result(
@@ -192,8 +206,8 @@ class SchedulingBootstrapHealthService:
 
         validation_passed = self._get_validation_result(bootstrap)
 
-        cleanup_failures = self._extract_cleanup_failures(
-            report.error if report else None
+        cleanup_failures = (
+            report.cleanup_errors if report is not None else ()
         )
 
         details: list[str] = []
@@ -257,7 +271,8 @@ class SchedulingBootstrapHealthService:
 
         if cleanup_failures:
             details.append(
-                "Cleanup failures were recorded"
+                "Cleanup failures were recorded: "
+                + "; ".join(cleanup_failures)
             )
 
         if report is not None and report.error:
