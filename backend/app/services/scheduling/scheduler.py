@@ -9,6 +9,7 @@ from typing import Any
 from uuid import uuid4
 
 from apscheduler.job import Job
+from apscheduler.events import EVENT_JOB_SUBMITTED
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.date import DateTrigger
@@ -46,6 +47,11 @@ class SchedulerService:
         self._tasks: dict[str, BaseScheduledTask] = {}
         self._results: deque[ScheduledTaskResult] = deque(
             maxlen=result_history_size
+        )
+        self._submitted_run_times: dict[str, deque[datetime]] = {}
+        self._scheduler.add_listener(
+            self._capture_submitted_run_times,
+            EVENT_JOB_SUBMITTED,
         )
 
     @property
@@ -90,6 +96,25 @@ class SchedulerService:
 
         if task_name not in self._tasks:
             raise KeyError(f"Unknown scheduled task: {task_name}")
+
+        referencing_jobs = [
+            job
+            for job in self._scheduler.get_jobs()
+            if (
+                job.func == self._execute_task
+                and job.args
+                and job.args[0] == task_name
+            )
+        ]
+
+        if referencing_jobs:
+            job_ids = ", ".join(
+                sorted(job.id for job in referencing_jobs)
+            )
+            raise ValueError(
+                f"Cannot unregister task '{task_name}' while scheduled "
+                f"jobs reference it: {job_ids}"
+            )
 
         for job in self._scheduler.get_jobs():
             if (
@@ -287,7 +312,10 @@ class SchedulerService:
         context = ScheduledTaskContext(
             job_id=job_id,
             execution_id=str(uuid4()),
-            scheduled_at=execution_time,
+            scheduled_at=self._take_scheduled_run_time(
+                job_id,
+                fallback=execution_time,
+            ),
             started_at=execution_time,
         )
 
@@ -353,6 +381,45 @@ class SchedulerService:
         """Append an execution result to the bounded in-memory history."""
 
         self._results.append(result)
+
+    def _capture_submitted_run_times(self, event: Any) -> None:
+        """Retain APScheduler's scheduled timestamps for task contexts."""
+
+        scheduled_run_times = getattr(
+            event,
+            "scheduled_run_times",
+            None,
+        )
+        job_id = getattr(event, "job_id", None)
+
+        if not job_id or not scheduled_run_times:
+            return
+
+        pending = self._submitted_run_times.setdefault(
+            job_id,
+            deque(),
+        )
+        pending.extend(scheduled_run_times)
+
+    def _take_scheduled_run_time(
+        self,
+        job_id: str,
+        *,
+        fallback: datetime,
+    ) -> datetime:
+        """Return the next submitted fire time, or a safe fallback."""
+
+        pending = self._submitted_run_times.get(job_id)
+
+        if not pending:
+            return fallback
+
+        scheduled_at = pending.popleft()
+
+        if not pending:
+            self._submitted_run_times.pop(job_id, None)
+
+        return scheduled_at.astimezone(timezone.utc)
 
     def get_job(self, job_id: str) -> Job | None:
         """Return a scheduled job by its identifier."""

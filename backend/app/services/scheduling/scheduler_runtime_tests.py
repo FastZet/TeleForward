@@ -10,6 +10,7 @@ import pytest
 
 from app.services.scheduling.scheduler_lifecycle import (
     SchedulerLifecycle,
+    SchedulerLifecycleError,
     SchedulerLifecycleState,
 )
 from app.services.scheduling.scheduler_runtime import (
@@ -270,7 +271,7 @@ async def test_register_tasks_delegates_batch(
 
     runtime.register_tasks(tasks)
 
-    registry.register_many.assert_called_once_with(tasks)
+    registry.register_many.assert_called_once_with(tuple(tasks))
 
 
 def test_get_task_returns_registered_task(

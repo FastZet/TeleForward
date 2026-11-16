@@ -703,6 +703,13 @@ async def test_start_after_failed_shutdown_is_allowed(
 
     manager.shutdown_error = None
 
+    with pytest.raises(
+        SchedulerLifecycleError,
+        match="previous components still require cleanup",
+    ):
+        await lifecycle.start()
+
+    await lifecycle.shutdown()
     await lifecycle.start()
 
     assert lifecycle.state == SchedulerLifecycleState.RUNNING

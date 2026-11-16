@@ -11,14 +11,14 @@ import pytest
 from fastapi import FastAPI
 
 from app.services.scheduling.configuration_api_security_audit_health_status_monitor import (
+    SecurityAuditHealthStatusMonitor,
+)
+from app.services.scheduling.configuration_api_security_audit_health_status_monitor_integration import (
     install_configuration_api_security_audit_health_status_monitor,
 )
 from app.services.scheduling.configuration_api_security_audit_health_status_monitor_lifespan import (
     SecurityAuditHealthStatusMonitorLifespanError,
     create_security_audit_health_status_monitor_lifespan,
-)
-from app.services.scheduling.configuration_api_security_audit_health_status_monitor import (
-    SecurityAuditHealthStatusMonitor,
 )
 
 

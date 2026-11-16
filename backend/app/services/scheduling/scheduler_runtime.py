@@ -174,6 +174,21 @@ class SchedulerRuntime:
 
         self._task_registry.register(task)
 
+        register = getattr(self._manager, "register_task", None)
+
+        if callable(register):
+            try:
+                result = register(task)
+
+                if inspect.isawaitable(result):
+                    raise SchedulerRuntimeError(
+                        "Scheduler manager task registration must be "
+                        "synchronous"
+                    )
+            except Exception:
+                self._task_registry.unregister(task.name)
+                raise
+
     def register_tasks(self, tasks: Iterable[Any]) -> None:
         """
         Register multiple scheduled tasks.
@@ -182,7 +197,45 @@ class SchedulerRuntime:
         its duplicate-registration policy.
         """
 
-        self._task_registry.register_many(tasks)
+        task_list = tuple(tasks)
+        self._task_registry.register_many(task_list)
+
+        register = getattr(self._manager, "register_task", None)
+
+        if not callable(register):
+            return
+
+        registered: list[Any] = []
+
+        try:
+            for task in task_list:
+                result = register(task)
+
+                if inspect.isawaitable(result):
+                    raise SchedulerRuntimeError(
+                        "Scheduler manager task registration must be "
+                        "synchronous"
+                    )
+
+                registered.append(task)
+        except Exception:
+            unregister = getattr(self._manager, "unregister_task", None)
+
+            if callable(unregister):
+                for task in reversed(registered):
+                    try:
+                        unregister(task.name)
+                    except Exception:
+                        logger.exception(
+                            "Could not roll back task registration: %s",
+                            task.name,
+                        )
+
+            for task in task_list:
+                if self._task_registry.contains(task.name):
+                    self._task_registry.unregister(task.name)
+
+            raise
 
     def get_task(self, task_name: str) -> Any:
         """Retrieve a registered task by name."""
@@ -210,6 +263,17 @@ class SchedulerRuntime:
             raise SchedulerRuntimeError(
                 f"Scheduled task is not registered: {task_name}"
             )
+
+        unregister = getattr(self._manager, "unregister_task", None)
+
+        if callable(unregister):
+            result = unregister(task_name)
+
+            if inspect.isawaitable(result):
+                raise SchedulerRuntimeError(
+                    "Scheduler manager task unregistration must be "
+                    "synchronous"
+                )
 
         self._task_registry.unregister(task_name)
 

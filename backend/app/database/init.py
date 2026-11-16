@@ -21,6 +21,7 @@ from app.database.base import Base
 from app.database.engine import get_database_engine
 from app.database.session import clear_session_factory_cache
 import app.models  # noqa: F401 - register all ORM models
+import app.services.scheduling.persistence  # noqa: F401 - register scheduled-job model
 
 
 logger = logging.getLogger(__name__)
