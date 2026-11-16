@@ -1,21 +1,24 @@
 
 """Integrated cancellation-aware scheduler health API lifespan.
 
-This module composes:
-- The existing bootstrap health API installation.
-- The cancellation-aware cleanup coordinator.
-- Existing application lifespan contexts.
+Composes the bootstrap health API integration with an existing FastAPI
+lifespan and cancellation-aware cleanup.
 
-The original lifespan implementation remains available in
-integration_bootstrap_health_api_lifespan.py.
+Exception policy:
+- Primary application/startup exceptions are preserved.
+- Existing lifespan context managers retain their suppression semantics.
+- Every registered shutdown operation is attempted.
+- Cleanup cancellation is kept separate from ordinary cleanup failures.
+- Cleanup failures are retained in structured reports.
 """
 
 from __future__ import annotations
 
 import inspect
 import logging
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
+from types import TracebackType
 from typing import Any
 
 from fastapi import FastAPI
@@ -34,11 +37,8 @@ from app.services.scheduling.integration_bootstrap_health_api_lifespan import (
 )
 from app.services.scheduling.integration_bootstrap_health_api_lifespan_revision import (
     CleanupCancelledError,
-    CleanupExecutionError,
-    CleanupFailure,
     CleanupReport,
     execute_cleanup_resiliently,
-    raise_for_cleanup_report,
 )
 
 logger = logging.getLogger(__name__)
@@ -49,7 +49,7 @@ class BootstrapHealthLifespanIntegrationError(RuntimeError):
 
 
 class BootstrapHealthLifespanShutdownError(RuntimeError):
-    """Raised when integrated lifespan shutdown fails."""
+    """Raised when one or more shutdown operations fail."""
 
     def __init__(self, report: CleanupReport) -> None:
         if not isinstance(report, CleanupReport):
@@ -92,17 +92,19 @@ async def _resolve_lifespan(
     factory: LifespanFactory,
     app: FastAPI,
 ) -> Any:
-    """Resolve an existing lifespan factory."""
+    """Resolve and validate an existing lifespan context manager."""
 
     context = factory(app)
 
     if inspect.isawaitable(context):
         context = await context
 
-    if not (
-        hasattr(context, "__aenter__")
-        and hasattr(context, "__aexit__")
-    ):
+    if not callable(getattr(context, "__aenter__", None)):
+        raise TypeError(
+            "existing_lifespan must return an async context manager"
+        )
+
+    if not callable(getattr(context, "__aexit__", None)):
         raise TypeError(
             "existing_lifespan must return an async context manager"
         )
@@ -114,10 +116,12 @@ async def _install_integration(
     app: FastAPI,
     service: SchedulingBootstrapHealthService | None,
 ) -> SchedulingBootstrapHealthAPIIntegration:
-    """Install or reuse the combined health integration."""
+    """Install or reuse the combined bootstrap health integration."""
 
     if is_bootstrap_health_api_integration_installed(app):
-        integration = app.state.scheduling_bootstrap_health_api_integration
+        integration = (
+            app.state.scheduling_bootstrap_health_api_integration
+        )
 
         if not isinstance(
             integration,
@@ -135,6 +139,34 @@ async def _install_integration(
     )
 
 
+def _validate_arguments(
+    service: SchedulingBootstrapHealthService | None,
+    existing_lifespan: LifespanFactory | None,
+    callbacks: tuple[LifespanCallback | None, ...],
+) -> None:
+    """Validate lifespan factory arguments."""
+
+    if service is not None and not isinstance(
+        service,
+        SchedulingBootstrapHealthService,
+    ):
+        raise TypeError(
+            "service must be a SchedulingBootstrapHealthService"
+        )
+
+    if (
+        existing_lifespan is not None
+        and not callable(existing_lifespan)
+    ):
+        raise TypeError("existing_lifespan must be callable")
+
+    if any(
+        callback is not None and not callable(callback)
+        for callback in callbacks
+    ):
+        raise TypeError("lifespan callbacks must be callable")
+
+
 def create_integrated_bootstrap_health_lifespan(
     *,
     service: SchedulingBootstrapHealthService | None = None,
@@ -144,22 +176,23 @@ def create_integrated_bootstrap_health_lifespan(
     before_shutdown: LifespanCallback | None = None,
     after_shutdown: LifespanCallback | None = None,
 ) -> LifespanFactory:
-    """Create an integrated FastAPI lifespan.
+    """Create the integrated bootstrap health API lifespan.
+
+    Startup order:
+        1. Enter existing application lifespan.
+        2. Run before_start.
+        3. Install or reuse the bootstrap health API integration.
+        4. Run after_start.
+        5. Yield control to the application.
 
     Shutdown order:
-        1. before_shutdown callback
-        2. after_shutdown callback
-        3. existing application's lifespan exit
+        1. Run before_shutdown if integration was installed.
+        2. Run after_shutdown if integration was installed.
+        3. Exit the existing application lifespan if entered.
 
-    The cleanup coordinator attempts every operation even when an earlier
-    operation fails or raises cancellation.
+    Existing context-manager suppression is respected. Cleanup failures
+    do not silently replace an unsuppressed primary exception.
     """
-
-    if service is not None and not isinstance(
-        service,
-        SchedulingBootstrapHealthService,
-    ):
-        raise TypeError("service must be a SchedulingBootstrapHealthService")
 
     callbacks = (
         before_start,
@@ -168,23 +201,24 @@ def create_integrated_bootstrap_health_lifespan(
         after_shutdown,
     )
 
-    if any(
-        callback is not None and not callable(callback)
-        for callback in callbacks
-    ):
-        raise TypeError("lifespan callbacks must be callable")
-
-    if existing_lifespan is not None and not callable(existing_lifespan):
-        raise TypeError("existing_lifespan must be callable")
+    _validate_arguments(
+        service,
+        existing_lifespan,
+        callbacks,
+    )
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         if not isinstance(app, FastAPI):
             raise TypeError("app must be a FastAPI instance")
 
-        existing_context = None
-        primary_error: BaseException | None = None
+        existing_context: Any | None = None
+        existing_context_entered = False
         integration_installed = False
+
+        primary_error: BaseException | None = None
+        primary_traceback: TracebackType | None = None
+        exception_suppressed = False
 
         try:
             if existing_lifespan is not None:
@@ -192,12 +226,13 @@ def create_integrated_bootstrap_health_lifespan(
                     existing_lifespan,
                     app,
                 )
+
                 await existing_context.__aenter__()
+                existing_context_entered = True
 
             await _invoke_callback(before_start, app)
 
             integration = await _install_integration(app, service)
-            integration_installed = True
 
             if not isinstance(
                 integration,
@@ -207,67 +242,85 @@ def create_integrated_bootstrap_health_lifespan(
                     "Health API installation returned an invalid integration"
                 )
 
+            integration_installed = True
+
             await _invoke_callback(after_start, app)
 
             yield
 
         except BaseException as exc:
             primary_error = exc
-            raise
+            primary_traceback = exc.__traceback__
 
-        finally:
-            operations: list[tuple[str, Callable[[], Any]]] = []
+        operations: list[tuple[str, Callable[[], Any]]] = []
 
-            if integration_installed:
-                operations.append(
-                    (
-                        "before_shutdown",
-                        lambda: _invoke_callback(before_shutdown, app),
-                    )
+        if integration_installed:
+            operations.append(
+                (
+                    "before_shutdown",
+                    lambda: _invoke_callback(before_shutdown, app),
+                )
+            )
+
+            operations.append(
+                (
+                    "after_shutdown",
+                    lambda: _invoke_callback(after_shutdown, app),
+                )
+            )
+
+        if existing_context_entered:
+            async def exit_existing_lifespan() -> None:
+                nonlocal exception_suppressed
+
+                if existing_context is None:
+                    return
+
+                error = primary_error
+
+                result = await existing_context.__aexit__(
+                    type(error) if error is not None else None,
+                    error,
+                    primary_traceback if error is not None else None,
                 )
 
-                operations.append(
-                    (
-                        "after_shutdown",
-                        lambda: _invoke_callback(after_shutdown, app),
-                    )
+                exception_suppressed = bool(result)
+
+            operations.append(
+                (
+                    "existing_lifespan_exit",
+                    exit_existing_lifespan,
                 )
+            )
 
-            if existing_context is not None:
-                operations.append(
-                    (
-                        "existing_lifespan_exit",
-                        lambda: existing_context.__aexit__(
-                            type(primary_error) if primary_error else None,
-                            primary_error,
-                            primary_error.__traceback__ if primary_error else None,
-                        ),
-                    )
-                )
+        report: CleanupReport | None = None
 
-            if not operations:
-                return
-
+        if operations:
             report = await execute_cleanup_resiliently(operations)
 
-            if primary_error is not None:
-                if report.failures or report.cancellation is not None:
-                    logger.error(
-                        "Lifespan cleanup encountered errors while "
-                        "preserving the primary application exception: %s",
-                        report,
-                    )
-
-                # Do not replace the original application/startup exception.
-                return
-
-            if report.cancellation is not None:
-                raise CleanupCancelledError(report) from report.cancellation
-
-            if report.failures:
-                raise BootstrapHealthLifespanShutdownError(report) from (
-                    report.failures[0].error
+        if primary_error is not None and not exception_suppressed:
+            if report is not None and (
+                report.failures or report.cancellation is not None
+            ):
+                logger.error(
+                    "Lifespan cleanup encountered errors while "
+                    "preserving the primary exception. "
+                    "Cleanup report: %r",
+                    report,
                 )
+
+            raise primary_error.with_traceback(primary_traceback)
+
+        if report is None:
+            return
+
+        if report.cancellation is not None:
+            raise CleanupCancelledError(report) from report.cancellation
+
+        if report.failures:
+            raise BootstrapHealthLifespanShutdownError(report) from (
+                report.failures[0].error
+            )
 
     return lifespan
 
@@ -276,11 +329,11 @@ def install_integrated_bootstrap_health_lifespan(
     app: FastAPI,
     **kwargs: Any,
 ) -> LifespanFactory:
-    """Install the integrated lifespan on a FastAPI application.
+    """Assign the integrated lifespan to an existing FastAPI application.
 
-    The returned lifespan must be supplied to FastAPI during application
-    construction for normal lifespan execution. This helper assigns the
-    router lifespan context for applications that have already been created.
+    Prefer passing the returned lifespan to FastAPI during application
+    construction. This helper changes the router lifespan context and must
+    be called before the application starts serving requests.
     """
 
     if not isinstance(app, FastAPI):
