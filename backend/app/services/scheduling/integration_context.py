@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from types import MappingProxyType
 from typing import Any, Mapping
 
 from app.services.scheduling.component_adapters import (
@@ -15,6 +16,7 @@ from app.services.scheduling.component_adapters import (
 )
 from app.services.scheduling.integration_validator import (
     IntegrationValidationReport,
+    SchedulingIntegrationError,
     SchedulingIntegrationValidator,
 )
 
@@ -50,12 +52,8 @@ class SchedulingIntegrationContext:
     ) -> SchedulingIntegrationContext:
         """Adapt and validate the scheduling components.
 
-        If scheduler is omitted, the scheduler attribute exposed by the
-        scheduler manager is used.
-
-        The supplied scheduler, when present, must be the same underlying
-        object exposed by the manager. This prevents the context from
-        accidentally combining two independent scheduler instances.
+        If scheduler is omitted, the scheduler exposed by the manager
+        is used. If supplied, it must be the identical object.
         """
         try:
             manager_adapter = SchedulerManagerAdapter(
@@ -111,9 +109,17 @@ class SchedulingIntegrationContext:
             else SchedulingIntegrationValidator()
         )
 
+        if not isinstance(
+            selected_validator,
+            SchedulingIntegrationValidator,
+        ):
+            raise TypeError(
+                "validator must be a SchedulingIntegrationValidator"
+            )
+
         try:
             report = selected_validator.validate_or_raise(components)
-        except Exception as exc:
+        except SchedulingIntegrationError as exc:
             raise SchedulingIntegrationContextError(
                 "Scheduling component validation failed"
             ) from exc
@@ -132,14 +138,14 @@ class SchedulingIntegrationContext:
         return self.validation_report.valid
 
     @property
-    def components(self) -> dict[str, Any]:
-        """Return the adapted components indexed by canonical name."""
-        return {
+    def components(self) -> Mapping[str, Any]:
+        """Return an immutable mapping of adapted components."""
+        return MappingProxyType({
             "scheduler_manager": self.scheduler_manager,
             "task_registry": self.task_registry,
             "job_store": self.job_store,
             "scheduler": self.scheduler,
-        }
+        })
 
     def get_component(self, name: str) -> Any:
         """Retrieve an adapted component by its canonical name."""
@@ -165,6 +171,21 @@ class SchedulingIntegrationContext:
             else SchedulingIntegrationValidator()
         )
 
-        return selected_validator.validate_or_raise(
-            self.components
-        )
+        if not isinstance(
+            selected_validator,
+            SchedulingIntegrationValidator,
+        ):
+            raise TypeError(
+                "validator must be a SchedulingIntegrationValidator"
+            )
+
+        try:
+            # The validator currently accepts a dictionary. Convert the
+            # immutable public mapping into a fresh validation snapshot.
+            return selected_validator.validate_or_raise(
+                dict(self.components)
+            )
+        except SchedulingIntegrationError as exc:
+            raise SchedulingIntegrationContextError(
+                "Scheduling component revalidation failed"
+            ) from exc
