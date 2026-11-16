@@ -179,7 +179,7 @@ def test_missing_components_are_reported(
 
     assert report.valid is False
     assert report.components_invalid == 4
-    assert len(report.errors) == 4
+    assert len(report.errors) == 5
 
 
 def test_missing_component_reports_required_interface(

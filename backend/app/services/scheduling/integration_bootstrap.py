@@ -406,7 +406,14 @@ class SchedulingIntegrationBootstrap:
                 components
             )
 
-            self._record_failure(exc, cleanup_errors)
+            cancellation_error = (
+                exc
+                if str(exc)
+                else SchedulingBootstrapError(
+                    "Bootstrap was cancelled"
+                )
+            )
+            self._record_failure(cancellation_error, cleanup_errors)
 
             logger.warning(
                 "Scheduling integration bootstrap was cancelled"

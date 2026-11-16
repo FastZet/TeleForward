@@ -37,6 +37,10 @@ from app.services.scheduling.integration_bootstrap_health_integration import (
 )
 
 
+def object_factory() -> object:
+    return object()
+
+
 @pytest.fixture
 def app() -> FastAPI:
     return FastAPI()
@@ -114,7 +118,13 @@ def test_install_rejects_service_and_bootstrap_together(
         SchedulingIntegrationBootstrap,
     )
 
-    bootstrap = SchedulingIntegrationBootstrap({})
+    bootstrap = SchedulingIntegrationBootstrap(
+        {
+            "scheduler_manager": object_factory,
+            "task_registry": object_factory,
+            "job_store": object_factory,
+        }
+    )
 
     with pytest.raises(ValueError):
         install_bootstrap_health_api_integration(
@@ -131,7 +141,7 @@ def test_install_rejects_duplicate_combined_integration(
     with pytest.raises(BootstrapHealthAPIIntegrationError):
         install_bootstrap_health_api_integration(
             app,
-            installed.service,
+            SchedulingBootstrapHealthService(),
         )
 
 
@@ -502,7 +512,13 @@ def test_remove_does_not_close_bootstrap(
         SchedulingIntegrationBootstrap,
     )
 
-    bootstrap = SchedulingIntegrationBootstrap({})
+    bootstrap = SchedulingIntegrationBootstrap(
+        {
+            "scheduler_manager": object_factory,
+            "task_registry": object_factory,
+            "job_store": object_factory,
+        }
+    )
     service = SchedulingBootstrapHealthService(bootstrap)
 
     install_bootstrap_health_api_integration(

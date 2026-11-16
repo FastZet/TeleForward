@@ -198,8 +198,8 @@ class SecurityAuditMiddleware:
 
         return (
             method == "OPTIONS"
-            and "origin" in headers
-            and "access-control-request-method" in headers
+            and b"origin" in headers
+            and b"access-control-request-method" in headers
         )
 
     @staticmethod

@@ -62,6 +62,21 @@ def install_configuration_api_security_audit_health_status(
             "Consolidated security audit health status is already installed"
         )
 
+    installed_flag = getattr(
+        app.state,
+        HEALTH_STATUS_INSTALLATION_STATE_KEY,
+        False,
+    )
+    existing_snapshot = getattr(
+        app.state,
+        HEALTH_STATUS_STATE_KEY,
+        None,
+    )
+    if installed_flag or existing_snapshot is not None:
+        raise SecurityAuditHealthStatusIntegrationError(
+            "Existing consolidated security audit health state is invalid"
+        )
+
     try:
         report = _get_audit_report(app)
         api_installed = (

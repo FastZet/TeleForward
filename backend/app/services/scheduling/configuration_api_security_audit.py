@@ -588,7 +588,7 @@ class SecurityAuditLogger:
                         self.path,
                     )
 
-                    if self.fsync:
+                    if self.fsync and os.name == "posix":
                         directory_descriptor = os.open(
                             self.path.parent,
                             os.O_RDONLY,

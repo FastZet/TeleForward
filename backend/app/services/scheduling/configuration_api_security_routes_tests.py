@@ -99,7 +99,7 @@ def client(monkeypatch: pytest.MonkeyPatch):
     app = create_test_app(
         principal=principal,
         permissions={
-            ConfigurationPermission.READ_CONFIGURATION,
+            ConfigurationPermission.VIEW_CONFIGURATION,
         },
     )
 
@@ -187,7 +187,7 @@ def test_permissions_endpoint_returns_granted_permissions(
     assert payload["permissions"] == [
         {
             "permission": (
-                ConfigurationPermission.READ_CONFIGURATION.value
+                ConfigurationPermission.VIEW_CONFIGURATION.value
             ),
             "granted": True,
         }

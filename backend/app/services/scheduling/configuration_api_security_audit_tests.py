@@ -509,7 +509,7 @@ def test_file_size_limit_rejects_additional_record(tmp_path: Path) -> None:
     log_path = tmp_path / "security.jsonl"
     logger = SecurityAuditLogger(
         log_path,
-        max_file_size_bytes=300,
+        max_file_size_bytes=1024,
         fsync=False,
     )
 
@@ -519,7 +519,7 @@ def test_file_size_limit_rejects_additional_record(tmp_path: Path) -> None:
             logger.record(
                 make_event(
                     event_id="second",
-                    metadata={"payload": "x" * 400},
+                    metadata={"payload": "x" * 1200},
                 )
             )
     finally:

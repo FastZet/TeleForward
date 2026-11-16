@@ -192,9 +192,7 @@ def test_inspect_returns_degraded_without_scheduler_lifespan(
         health_api_lifespan=lambda application: None,
     )
 
-    lifespan = (
-        app.state.__dict__.get(COMPOSITION_STATE_KEY)
-    )
+    lifespan = getattr(app.state, COMPOSITION_STATE_KEY, None)
 
     app.router.lifespan_context = lifespan["lifespan"]
 

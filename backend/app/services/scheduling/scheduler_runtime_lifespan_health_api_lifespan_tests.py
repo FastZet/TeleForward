@@ -16,6 +16,16 @@ from app.services.scheduling import (
 from app.services.scheduling.scheduler_runtime_lifespan_health import (
     SchedulerRuntimeLifespanHealthService,
 )
+from app.services.scheduling.scheduler_runtime_lifespan_health_api_integration import (
+    INTEGRATION_STATE_KEY,
+)
+
+
+def apply_lifespan(
+    app: FastAPI,
+    lifespan,
+) -> None:
+    app.router.lifespan_context = lifespan
 
 
 @pytest.fixture
@@ -48,6 +58,7 @@ def test_lifespan_installs_health_api_on_startup(
     """Entering the lifespan must install the health API."""
 
     lifespan = health_lifespan.create_scheduler_health_api_lifespan()
+    apply_lifespan(app, lifespan)
 
     with TestClient(app) as client:
         # Entering TestClient starts the FastAPI lifespan.
@@ -57,7 +68,7 @@ def test_lifespan_installs_health_api_on_startup(
 
         assert getattr(
             app.state,
-            "scheduler_runtime_lifespan_health_api_integration",
+            INTEGRATION_STATE_KEY,
             False,
         )
 
@@ -80,6 +91,7 @@ def test_lifespan_uses_supplied_service(
     lifespan = health_lifespan.create_scheduler_health_api_lifespan(
         service=service,
     )
+    apply_lifespan(app, lifespan)
 
     with TestClient(app):
         from app.services.scheduling.scheduler_runtime_lifespan_health_api_integration import (
@@ -108,8 +120,9 @@ def test_existing_lifespan_startup_and_shutdown_are_preserved(
     lifespan = health_lifespan.create_scheduler_health_api_lifespan(
         existing_lifespan=existing_lifespan,
     )
+    apply_lifespan(app, lifespan)
 
-    with TestClient(app, lifespan=lifespan):
+    with TestClient(app):
         events.append("application_running")
 
     assert events == [
@@ -150,12 +163,13 @@ def test_existing_lifespan_cleanup_runs_after_health_startup_failure(
     lifespan = health_lifespan.create_scheduler_health_api_lifespan(
         existing_lifespan=existing_lifespan,
     )
+    apply_lifespan(app, lifespan)
 
     with pytest.raises(
         RuntimeError,
         match="Simulated health setup failure",
     ):
-        with TestClient(app, lifespan=lifespan):
+        with TestClient(app):
             pass
 
     assert events == [
@@ -177,12 +191,13 @@ def test_existing_lifespan_startup_failure_is_wrapped(
     lifespan = health_lifespan.create_scheduler_health_api_lifespan(
         existing_lifespan=existing_lifespan,
     )
+    apply_lifespan(app, lifespan)
 
     with pytest.raises(
         health_lifespan.SchedulerHealthAPILifespanError,
         match="Existing application lifespan failed to start",
     ):
-        with TestClient(app, lifespan=lifespan):
+        with TestClient(app):
             pass
 
 
@@ -192,12 +207,13 @@ def test_application_exception_propagates_through_lifespan(
     """Application exceptions must not be swallowed."""
 
     lifespan = health_lifespan.create_scheduler_health_api_lifespan()
+    apply_lifespan(app, lifespan)
 
     with pytest.raises(
         RuntimeError,
         match="Application failure",
     ):
-        with TestClient(app, lifespan=lifespan):
+        with TestClient(app):
             raise RuntimeError("Application failure")
 
 
@@ -207,19 +223,23 @@ def test_health_integration_remains_installed_after_shutdown(
     """The integration must remain installed after lifespan exit."""
 
     lifespan = health_lifespan.create_scheduler_health_api_lifespan()
+    apply_lifespan(app, lifespan)
 
-    with TestClient(app, lifespan=lifespan):
+    with TestClient(app):
         pass
 
-    state = health_lifespan.get_scheduler_health_api_lifespan(
-        app
+    from app.services.scheduling.scheduler_runtime_lifespan_health_api_integration import (
+        get_scheduler_health_api_integration,
     )
 
-    assert callable(state)
+    assert isinstance(
+        get_scheduler_health_api_integration(app),
+        SchedulerRuntimeLifespanHealthService,
+    )
 
     assert getattr(
         app.state,
-        "scheduler_runtime_lifespan_health_api_integration",
+        INTEGRATION_STATE_KEY,
         False,
     )
 

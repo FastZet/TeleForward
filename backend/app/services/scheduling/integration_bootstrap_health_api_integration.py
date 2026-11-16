@@ -366,14 +366,20 @@ def remove_bootstrap_health_api_integration(
             app.state,
             BOOTSTRAP_HEALTH_API_INTEGRATION_STATE_KEY,
         )
-    except AttributeError as exc:
+    except Exception as exc:
         # Restore the service if its removal was requested.
         if remove_service:
-            setattr(
-                app.state,
-                BOOTSTRAP_HEALTH_STATE_KEY,
-                registration.service,
-            )
+            try:
+                setattr(
+                    app.state,
+                    BOOTSTRAP_HEALTH_STATE_KEY,
+                    registration.service,
+                )
+            except Exception:
+                logger.exception(
+                    "Could not restore bootstrap health service after "
+                    "integration metadata removal failed"
+                )
 
         raise BootstrapHealthAPIIntegrationError(
             "Failed to remove combined integration metadata"

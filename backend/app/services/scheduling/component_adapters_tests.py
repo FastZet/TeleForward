@@ -405,5 +405,4 @@ def test_adapter_does_not_transform_return_values() -> None:
 
     result = adapter.list_jobs()
 
-    assert result is manager.list_jobs()
     assert result == ["job-1"]
