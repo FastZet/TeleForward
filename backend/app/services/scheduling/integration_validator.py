@@ -6,6 +6,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Iterable
 
+from app.services.scheduling.integration_contracts import (
+    DEFAULT_SCHEDULING_CONTRACTS,
+    InterfaceContract,
+)
+
 
 @dataclass(frozen=True, slots=True)
 class ComponentRequirement:
@@ -57,71 +62,35 @@ class IntegrationValidationReport:
         return tuple(messages)
 
 
+class SchedulingIntegrationError(RuntimeError):
+    """Raised when scheduling components fail integration validation."""
+
+
 class SchedulingIntegrationValidator:
     """Validate component interfaces before scheduler integration."""
 
-    DEFAULT_REQUIREMENTS = (
+    DEFAULT_REQUIREMENTS = tuple(
         ComponentRequirement(
-            component="scheduler_manager",
-            methods=(
-                "create_job",
-                "update_job",
-                "delete_job",
-                "enable_job",
-                "disable_job",
-                "list_jobs",
-                "restore_jobs",
-                "start",
-                "shutdown",
-            ),
-            attributes=("scheduler",),
-        ),
-        ComponentRequirement(
-            component="task_registry",
-            methods=(
-                "register",
-                "get",
-                "get_optional",
-                "unregister",
-                "contains",
-                "names",
-                "get_all",
-            ),
-        ),
-        ComponentRequirement(
-            component="job_store",
-            methods=(
-                "add",
-                "get",
-                "list_all",
-                "update",
-                "delete",
-                "close",
-            ),
-        ),
-        ComponentRequirement(
-            component="scheduler",
-            methods=(
-                "add_job",
-                "get_job",
-                "get_jobs",
-                "remove_job",
-                "start",
-                "shutdown",
-                "pause",
-                "resume",
-            ),
-        ),
+            component=contract.name,
+            methods=contract.required_methods,
+            attributes=contract.required_attributes,
+        )
+        for contract in DEFAULT_SCHEDULING_CONTRACTS
     )
 
     def __init__(
         self,
-        requirements: Iterable[ComponentRequirement] | None = None,
+        requirements: Iterable[
+            ComponentRequirement | InterfaceContract
+        ] | None = None,
     ) -> None:
         selected = (
-            tuple(requirements)
-            if requirements is not None
-            else self.DEFAULT_REQUIREMENTS
+            self.DEFAULT_REQUIREMENTS
+            if requirements is None
+            else tuple(
+                self._normalise_requirement(requirement)
+                for requirement in requirements
+            )
         )
 
         if not selected:
@@ -142,7 +111,9 @@ class SchedulingIntegrationValidator:
                     "Component names must not be empty"
                 )
 
-            if len(requirement.methods) != len(set(requirement.methods)):
+            if len(requirement.methods) != len(
+                set(requirement.methods)
+            ):
                 raise ValueError(
                     f"Duplicate method requirement for "
                     f"{requirement.component}"
@@ -157,6 +128,26 @@ class SchedulingIntegrationValidator:
                 )
 
         self._requirements = selected
+
+    @staticmethod
+    def _normalise_requirement(
+        requirement: ComponentRequirement | InterfaceContract,
+    ) -> ComponentRequirement:
+        """Convert supported contract types into validator requirements."""
+        if isinstance(requirement, ComponentRequirement):
+            return requirement
+
+        if isinstance(requirement, InterfaceContract):
+            return ComponentRequirement(
+                component=requirement.name,
+                methods=requirement.required_methods,
+                attributes=requirement.required_attributes,
+            )
+
+        raise TypeError(
+            "Requirements must be ComponentRequirement or "
+            "InterfaceContract instances"
+        )
 
     @staticmethod
     def _validate_component(
@@ -243,7 +234,3 @@ class SchedulingIntegrationValidator:
             )
 
         return report
-
-
-class SchedulingIntegrationError(RuntimeError):
-    """Raised when scheduling components fail integration validation."""
