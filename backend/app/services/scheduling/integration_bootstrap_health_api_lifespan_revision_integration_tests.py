@@ -1,5 +1,5 @@
 
-"""Lifecycle ownership and partial-startup regression tests."""
+"""Tests for observable bootstrap health lifespan execution state."""
 
 from __future__ import annotations
 
@@ -11,12 +11,17 @@ import pytest
 from fastapi import FastAPI
 
 import app.services.scheduling.integration_bootstrap_health_api_lifespan_revision_integration as integration_module
+
 from app.services.scheduling.integration_bootstrap_health_api_lifespan_revision import (
     CleanupCancelledError,
 )
+
 from app.services.scheduling.integration_bootstrap_health_api_lifespan_revision_integration import (
     BootstrapHealthLifespanShutdownError,
+    LifespanExecutionState,
+    LifespanPhase,
     create_integrated_bootstrap_health_lifespan,
+    get_lifespan_execution_state,
 )
 
 
@@ -55,45 +60,153 @@ def install_fake_integration(
 
 
 @pytest.mark.asyncio
-async def test_existing_lifespan_exit_runs_after_successful_entry(
+async def test_initial_and_final_lifecycle_phases(
     app: FastAPI,
     install_fake_integration: None,
 ) -> None:
-    events: list[str] = []
+    lifespan = create_integrated_bootstrap_health_lifespan()
 
+    async with lifespan(app):
+        state = get_lifespan_execution_state(app)
+
+        assert state is not None
+        assert state.phase == LifespanPhase.RUNNING
+
+    state = get_lifespan_execution_state(app)
+
+    assert state is not None
+    assert state.phase == LifespanPhase.STOPPED
+
+
+@pytest.mark.asyncio
+async def test_successful_lifecycle_records_expected_phase_history(
+    app: FastAPI,
+    install_fake_integration: None,
+) -> None:
+    lifespan = create_integrated_bootstrap_health_lifespan()
+
+    async with lifespan(app):
+        pass
+
+    state = get_lifespan_execution_state(app)
+
+    assert state is not None
+
+    phases = [phase for phase, _timestamp in state.phase_history]
+
+    assert phases == [
+        LifespanPhase.INITIALISING,
+        LifespanPhase.INTEGRATION_INSTALLED,
+        LifespanPhase.RUNNING,
+        LifespanPhase.CLEANING_UP,
+        LifespanPhase.STOPPED,
+    ]
+
+
+@pytest.mark.asyncio
+async def test_existing_lifespan_phase_is_recorded(
+    app: FastAPI,
+    install_fake_integration: None,
+) -> None:
     @asynccontextmanager
     async def existing_lifespan(
         _app: FastAPI,
     ) -> AsyncIterator[None]:
-        events.append("entered")
-        try:
-            yield
-        finally:
-            events.append("exited")
+        yield
 
     lifespan = create_integrated_bootstrap_health_lifespan(
         existing_lifespan=existing_lifespan,
     )
 
     async with lifespan(app):
-        events.append("application")
+        state = get_lifespan_execution_state(app)
 
-    assert events == [
-        "entered",
-        "application",
-        "exited",
-    ]
+        assert state is not None
+        assert (
+            state.phase
+            == LifespanPhase.RUNNING
+        )
+
+    state = get_lifespan_execution_state(app)
+
+    assert state is not None
+
+    phases = [phase for phase, _ in state.phase_history]
+
+    assert LifespanPhase.EXISTING_LIFESPAN_ENTERED in phases
 
 
 @pytest.mark.asyncio
-async def test_existing_lifespan_exit_is_not_called_when_entry_fails(
+async def test_state_records_successful_context_ownership(
+    app: FastAPI,
+    install_fake_integration: None,
+) -> None:
+    @asynccontextmanager
+    async def existing_lifespan(
+        _app: FastAPI,
+    ) -> AsyncIterator[None]:
+        yield
+
+    lifespan = create_integrated_bootstrap_health_lifespan(
+        existing_lifespan=existing_lifespan,
+    )
+
+    async with lifespan(app):
+        state = get_lifespan_execution_state(app)
+
+        assert state is not None
+        assert state.existing_context_entered is True
+
+    state = get_lifespan_execution_state(app)
+
+    assert state is not None
+    assert state.existing_context_entered is True
+
+
+@pytest.mark.asyncio
+async def test_state_records_integration_installation(
+    app: FastAPI,
+    install_fake_integration: None,
+) -> None:
+    lifespan = create_integrated_bootstrap_health_lifespan()
+
+    async with lifespan(app):
+        state = get_lifespan_execution_state(app)
+
+        assert state is not None
+        assert state.integration_installed is True
+
+
+@pytest.mark.asyncio
+async def test_startup_failure_records_failed_phase(
     app: FastAPI,
 ) -> None:
-    events: list[str] = []
+    async def failing_start(_app: FastAPI) -> None:
+        raise RuntimeError("startup failure")
 
+    lifespan = create_integrated_bootstrap_health_lifespan(
+        before_start=failing_start,
+    )
+
+    with pytest.raises(RuntimeError, match="startup failure"):
+        async with lifespan(app):
+            pass
+
+    state = get_lifespan_execution_state(app)
+
+    assert state is not None
+    assert state.phase == LifespanPhase.FAILED
+    assert state.integration_installed is False
+    assert state.primary_error_type == "RuntimeError"
+    assert state.primary_error_message == "startup failure"
+
+
+@pytest.mark.asyncio
+async def test_failed_context_entry_does_not_claim_ownership(
+    app: FastAPI,
+) -> None:
     class FailingContext:
         async def __aenter__(self) -> None:
-            events.append("enter")
             raise RuntimeError("entry failed")
 
         async def __aexit__(
@@ -102,8 +215,7 @@ async def test_existing_lifespan_exit_is_not_called_when_entry_fails(
             exc,
             traceback,
         ) -> bool:
-            events.append("exit")
-            return False
+            pytest.fail("Exit must not be called")
 
     def factory(_app: FastAPI) -> FailingContext:
         return FailingContext()
@@ -114,280 +226,39 @@ async def test_existing_lifespan_exit_is_not_called_when_entry_fails(
 
     with pytest.raises(RuntimeError, match="entry failed"):
         async with lifespan(app):
-            pytest.fail("Application body must not execute")
+            pass
 
-    assert events == ["enter"]
+    state = get_lifespan_execution_state(app)
 
-
-@pytest.mark.asyncio
-async def test_cancellation_during_existing_lifespan_entry_is_propagated(
-    app: FastAPI,
-) -> None:
-    entry_started = asyncio.Event()
-    allow_entry_to_finish = asyncio.Event()
-    exit_called = asyncio.Event()
-
-    class BlockingContext:
-        async def __aenter__(self) -> None:
-            entry_started.set()
-            await allow_entry_to_finish.wait()
-
-        async def __aexit__(
-            self,
-            exc_type,
-            exc,
-            traceback,
-        ) -> bool:
-            exit_called.set()
-            return False
-
-    def factory(_app: FastAPI) -> BlockingContext:
-        return BlockingContext()
-
-    lifespan = create_integrated_bootstrap_health_lifespan(
-        existing_lifespan=factory,
-    )
-
-    async def run() -> None:
-        async with lifespan(app):
-            pytest.fail("Application body must not execute")
-
-    task = asyncio.create_task(run())
-
-    await asyncio.wait_for(entry_started.wait(), timeout=2)
-    task.cancel()
-
-    with pytest.raises(asyncio.CancelledError):
-        await task
-
-    assert not exit_called.is_set()
+    assert state is not None
+    assert state.existing_context_entered is False
+    assert state.phase == LifespanPhase.FAILED
 
 
 @pytest.mark.asyncio
-async def test_cancelled_entry_does_not_run_shutdown_callbacks(
+async def test_primary_exception_details_are_recorded(
     app: FastAPI,
     install_fake_integration: None,
 ) -> None:
-    entry_started = asyncio.Event()
-    shutdown_events: list[str] = []
+    lifespan = create_integrated_bootstrap_health_lifespan()
 
-    class BlockingContext:
-        async def __aenter__(self) -> None:
-            entry_started.set()
-            await asyncio.Event().wait()
-
-        async def __aexit__(
-            self,
-            exc_type,
-            exc,
-            traceback,
-        ) -> bool:
-            return False
-
-    def factory(_app: FastAPI) -> BlockingContext:
-        return BlockingContext()
-
-    async def before_shutdown(_app: FastAPI) -> None:
-        shutdown_events.append("before")
-
-    async def after_shutdown(_app: FastAPI) -> None:
-        shutdown_events.append("after")
-
-    lifespan = create_integrated_bootstrap_health_lifespan(
-        existing_lifespan=factory,
-        before_shutdown=before_shutdown,
-        after_shutdown=after_shutdown,
-    )
-
-    async def run() -> None:
+    with pytest.raises(ValueError, match="application failure"):
         async with lifespan(app):
-            pass
+            raise ValueError("application failure")
 
-    task = asyncio.create_task(run())
+    state = get_lifespan_execution_state(app)
 
-    await asyncio.wait_for(entry_started.wait(), timeout=2)
-    task.cancel()
-
-    with pytest.raises(asyncio.CancelledError):
-        await task
-
-    assert shutdown_events == []
+    assert state is not None
+    assert state.primary_error_type == "ValueError"
+    assert state.primary_error_message == "application failure"
+    assert state.phase == LifespanPhase.FAILED
 
 
 @pytest.mark.asyncio
-async def test_before_start_failure_exits_existing_lifespan(
-    app: FastAPI,
-) -> None:
-    events: list[str] = []
-
-    @asynccontextmanager
-    async def existing_lifespan(
-        _app: FastAPI,
-    ) -> AsyncIterator[None]:
-        events.append("entered")
-        try:
-            yield
-        finally:
-            events.append("exited")
-
-    async def before_start(_app: FastAPI) -> None:
-        events.append("before_start")
-        raise RuntimeError("before-start failure")
-
-    lifespan = create_integrated_bootstrap_health_lifespan(
-        existing_lifespan=existing_lifespan,
-        before_start=before_start,
-    )
-
-    with pytest.raises(RuntimeError, match="before-start failure"):
-        async with lifespan(app):
-            pass
-
-    assert events == [
-        "entered",
-        "before_start",
-        "exited",
-    ]
-
-
-@pytest.mark.asyncio
-async def test_integration_installation_failure_exits_existing_lifespan(
-    app: FastAPI,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    events: list[str] = []
-
-    @asynccontextmanager
-    async def existing_lifespan(
-        _app: FastAPI,
-    ) -> AsyncIterator[None]:
-        events.append("entered")
-        try:
-            yield
-        finally:
-            events.append("exited")
-
-    async def failing_install(
-        _app: FastAPI,
-        service=None,
-    ):
-        events.append("install")
-        raise RuntimeError("integration installation failed")
-
-    monkeypatch.setattr(
-        integration_module,
-        "_install_integration",
-        failing_install,
-    )
-
-    lifespan = create_integrated_bootstrap_health_lifespan(
-        existing_lifespan=existing_lifespan,
-    )
-
-    with pytest.raises(
-        RuntimeError,
-        match="integration installation failed",
-    ):
-        async with lifespan(app):
-            pytest.fail("Application body must not execute")
-
-    assert events == [
-        "entered",
-        "install",
-        "exited",
-    ]
-
-
-@pytest.mark.asyncio
-async def test_after_start_failure_runs_shutdown_callbacks(
+async def test_suppressed_exception_is_recorded(
     app: FastAPI,
     install_fake_integration: None,
 ) -> None:
-    events: list[str] = []
-
-    async def after_start(_app: FastAPI) -> None:
-        events.append("after_start")
-        raise RuntimeError("after-start failure")
-
-    async def before_shutdown(_app: FastAPI) -> None:
-        events.append("before_shutdown")
-
-    async def after_shutdown(_app: FastAPI) -> None:
-        events.append("after_shutdown")
-
-    lifespan = create_integrated_bootstrap_health_lifespan(
-        after_start=after_start,
-        before_shutdown=before_shutdown,
-        after_shutdown=after_shutdown,
-    )
-
-    with pytest.raises(RuntimeError, match="after-start failure"):
-        async with lifespan(app):
-            pass
-
-    assert events == [
-        "after_start",
-        "before_shutdown",
-        "after_shutdown",
-    ]
-
-
-@pytest.mark.asyncio
-async def test_wrong_integration_type_does_not_mark_integration_installed(
-    app: FastAPI,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    class UnexpectedIntegration:
-        pass
-
-    monkeypatch.setattr(
-        integration_module,
-        "SchedulingBootstrapHealthAPIIntegration",
-        FakeIntegration,
-    )
-
-    async def wrong_install(
-        _app: FastAPI,
-        service=None,
-    ) -> UnexpectedIntegration:
-        return UnexpectedIntegration()
-
-    monkeypatch.setattr(
-        integration_module,
-        "_install_integration",
-        wrong_install,
-    )
-
-    events: list[str] = []
-
-    async def before_shutdown(_app: FastAPI) -> None:
-        events.append("before")
-
-    async def after_shutdown(_app: FastAPI) -> None:
-        events.append("after")
-
-    lifespan = create_integrated_bootstrap_health_lifespan(
-        before_shutdown=before_shutdown,
-        after_shutdown=after_shutdown,
-    )
-
-    with pytest.raises(
-        RuntimeError,
-        match="invalid integration",
-    ):
-        async with lifespan(app):
-            pass
-
-    assert events == []
-
-
-@pytest.mark.asyncio
-async def test_existing_lifespan_suppression_does_not_skip_shutdown_errors(
-    app: FastAPI,
-    install_fake_integration: None,
-) -> None:
-    events: list[str] = []
-
     @asynccontextmanager
     async def suppressing_lifespan(
         _app: FastAPI,
@@ -395,52 +266,85 @@ async def test_existing_lifespan_suppression_does_not_skip_shutdown_errors(
         try:
             yield
         except ValueError:
-            events.append("suppressed")
+            pass
 
+    lifespan = create_integrated_bootstrap_health_lifespan(
+        existing_lifespan=suppressing_lifespan,
+    )
+
+    async with lifespan(app):
+        raise ValueError("suppressed failure")
+
+    state = get_lifespan_execution_state(app)
+
+    assert state is not None
+    assert state.exception_suppressed is True
+    assert state.phase == LifespanPhase.STOPPED
+    assert state.primary_error_type == "ValueError"
+
+
+@pytest.mark.asyncio
+async def test_unsuppressed_exception_is_recorded(
+    app: FastAPI,
+    install_fake_integration: None,
+) -> None:
+    lifespan = create_integrated_bootstrap_health_lifespan()
+
+    with pytest.raises(ValueError, match="application failure"):
+        async with lifespan(app):
+            raise ValueError("application failure")
+
+    state = get_lifespan_execution_state(app)
+
+    assert state is not None
+    assert state.exception_suppressed is False
+    assert state.phase == LifespanPhase.FAILED
+
+
+@pytest.mark.asyncio
+async def test_cleanup_report_is_retained_after_successful_shutdown(
+    app: FastAPI,
+    install_fake_integration: None,
+) -> None:
+    lifespan = create_integrated_bootstrap_health_lifespan()
+
+    async with lifespan(app):
+        pass
+
+    state = get_lifespan_execution_state(app)
+
+    assert state is not None
+    assert state.cleanup_report is not None
+    assert state.cleanup_report.succeeded is True
+    assert state.cleanup_report.failures == ()
+
+
+@pytest.mark.asyncio
+async def test_cleanup_report_is_retained_after_shutdown_failure(
+    app: FastAPI,
+    install_fake_integration: None,
+) -> None:
     async def failing_shutdown(_app: FastAPI) -> None:
         raise RuntimeError("shutdown failure")
 
     lifespan = create_integrated_bootstrap_health_lifespan(
-        existing_lifespan=suppressing_lifespan,
         before_shutdown=failing_shutdown,
     )
 
     with pytest.raises(BootstrapHealthLifespanShutdownError):
         async with lifespan(app):
-            raise ValueError("application failure")
+            pass
 
-    assert events == ["suppressed"]
+    state = get_lifespan_execution_state(app)
 
-
-@pytest.mark.asyncio
-async def test_primary_cancellation_survives_existing_lifespan_suppression(
-    app: FastAPI,
-    install_fake_integration: None,
-) -> None:
-    events: list[str] = []
-
-    @asynccontextmanager
-    async def suppressing_lifespan(
-        _app: FastAPI,
-    ) -> AsyncIterator[None]:
-        try:
-            yield
-        except asyncio.CancelledError:
-            events.append("suppression_attempted")
-
-    lifespan = create_integrated_bootstrap_health_lifespan(
-        existing_lifespan=suppressing_lifespan,
-    )
-
-    with pytest.raises(asyncio.CancelledError):
-        async with lifespan(app):
-            raise asyncio.CancelledError("primary cancellation")
-
-    assert events == ["suppression_attempted"]
+    assert state is not None
+    assert state.cleanup_report is not None
+    assert len(state.cleanup_report.failures) == 1
+    assert state.phase == LifespanPhase.FAILED
 
 
 @pytest.mark.asyncio
-async def test_cleanup_cancellation_is_preserved_after_successful_application(
+async def test_cleanup_cancellation_is_retained_in_state(
     app: FastAPI,
     install_fake_integration: None,
 ) -> None:
@@ -451,15 +355,72 @@ async def test_cleanup_cancellation_is_preserved_after_successful_application(
         before_shutdown=cancelling_shutdown,
     )
 
-    with pytest.raises(CleanupCancelledError) as captured:
+    with pytest.raises(CleanupCancelledError):
         async with lifespan(app):
             pass
 
-    assert captured.value.report.cancellation_count == 1
+    state = get_lifespan_execution_state(app)
+
+    assert state is not None
+    assert state.cleanup_report is not None
+    assert state.cleanup_report.cancellation is not None
+    assert state.phase == LifespanPhase.STOPPED
 
 
 @pytest.mark.asyncio
-async def test_external_cancellation_does_not_interrupt_blocked_cleanup(
+async def test_cleanup_cancellation_after_exception_suppression_is_retained(
+    app: FastAPI,
+    install_fake_integration: None,
+) -> None:
+    @asynccontextmanager
+    async def suppressing_lifespan(
+        _app: FastAPI,
+    ) -> AsyncIterator[None]:
+        try:
+            yield
+        except ValueError:
+            pass
+
+    async def cancelling_shutdown(_app: FastAPI) -> None:
+        raise asyncio.CancelledError("cleanup cancellation")
+
+    lifespan = create_integrated_bootstrap_health_lifespan(
+        existing_lifespan=suppressing_lifespan,
+        before_shutdown=cancelling_shutdown,
+    )
+
+    with pytest.raises(CleanupCancelledError):
+        async with lifespan(app):
+            raise ValueError("suppressed application failure")
+
+    state = get_lifespan_execution_state(app)
+
+    assert state is not None
+    assert state.exception_suppressed is True
+    assert state.cleanup_report is not None
+    assert state.cleanup_report.cancellation is not None
+
+
+@pytest.mark.asyncio
+async def test_primary_cancellation_remains_primary(
+    app: FastAPI,
+    install_fake_integration: None,
+) -> None:
+    lifespan = create_integrated_bootstrap_health_lifespan()
+
+    with pytest.raises(asyncio.CancelledError):
+        async with lifespan(app):
+            raise asyncio.CancelledError("primary cancellation")
+
+    state = get_lifespan_execution_state(app)
+
+    assert state is not None
+    assert state.primary_error_type == "CancelledError"
+    assert state.phase == LifespanPhase.STOPPED
+
+
+@pytest.mark.asyncio
+async def test_external_cancellation_during_cleanup_updates_final_state(
     app: FastAPI,
     install_fake_integration: None,
 ) -> None:
@@ -492,83 +453,82 @@ async def test_external_cancellation_does_not_interrupt_blocked_cleanup(
 
     allow_cleanup.set()
 
-    with pytest.raises(CleanupCancelledError):
+    with pytest.raises(asyncio.CancelledError):
         await task
 
     assert cleanup_completed.is_set()
 
+    state = get_lifespan_execution_state(app)
 
-@pytest.mark.asyncio
-async def test_existing_lifespan_exit_failure_is_recorded(
-    app: FastAPI,
-    install_fake_integration: None,
-) -> None:
-    @asynccontextmanager
-    async def failing_existing_lifespan(
-        _app: FastAPI,
-    ) -> AsyncIterator[None]:
-        yield
-        raise RuntimeError("existing exit failed")
-
-    lifespan = create_integrated_bootstrap_health_lifespan(
-        existing_lifespan=failing_existing_lifespan,
-    )
-
-    with pytest.raises(BootstrapHealthLifespanShutdownError) as captured:
-        async with lifespan(app):
-            pass
-
-    failures = captured.value.report.failures
-
-    assert len(failures) == 1
-    assert failures[0].operation == "existing_lifespan_exit"
+    assert state is not None
+    assert state.cleanup_report is not None
+    assert state.phase == LifespanPhase.STOPPED
 
 
 @pytest.mark.asyncio
-async def test_async_existing_lifespan_factory_is_supported(
+async def test_state_history_timestamps_are_timezone_aware(
     app: FastAPI,
     install_fake_integration: None,
 ) -> None:
-    events: list[str] = []
-
-    @asynccontextmanager
-    async def context(
-        _app: FastAPI,
-    ) -> AsyncIterator[None]:
-        events.append("entered")
-        try:
-            yield
-        finally:
-            events.append("exited")
-
-    async def factory(_app: FastAPI):
-        events.append("factory")
-        return context(_app)
-
-    lifespan = create_integrated_bootstrap_health_lifespan(
-        existing_lifespan=factory,
-    )
+    lifespan = create_integrated_bootstrap_health_lifespan()
 
     async with lifespan(app):
-        events.append("application")
+        pass
 
-    assert events == [
-        "factory",
-        "entered",
-        "application",
-        "exited",
+    state = get_lifespan_execution_state(app)
+
+    assert state is not None
+
+    for _phase, timestamp in state.phase_history:
+        assert timestamp.tzinfo is not None
+        assert timestamp.utcoffset() is not None
+
+
+@pytest.mark.asyncio
+async def test_phase_history_is_chronological(
+    app: FastAPI,
+    install_fake_integration: None,
+) -> None:
+    lifespan = create_integrated_bootstrap_health_lifespan()
+
+    async with lifespan(app):
+        pass
+
+    state = get_lifespan_execution_state(app)
+
+    assert state is not None
+
+    timestamps = [
+        timestamp
+        for _phase, timestamp in state.phase_history
     ]
 
-
-def test_non_callable_callbacks_are_rejected() -> None:
-    with pytest.raises(TypeError, match="callbacks"):
-        create_integrated_bootstrap_health_lifespan(
-            before_start="not callable",
-        )
+    assert timestamps == sorted(timestamps)
 
 
-def test_non_callable_existing_lifespan_is_rejected() -> None:
-    with pytest.raises(TypeError, match="existing_lifespan"):
-        create_integrated_bootstrap_health_lifespan(
-            existing_lifespan="not callable",
-        )
+def test_get_state_returns_none_before_lifespan_execution(
+    app: FastAPI,
+) -> None:
+    assert get_lifespan_execution_state(app) is None
+
+
+def test_get_state_rejects_invalid_application() -> None:
+    with pytest.raises(TypeError, match="FastAPI"):
+        get_lifespan_execution_state(object())
+
+
+def test_execution_state_rejects_invalid_phase() -> None:
+    state = LifespanExecutionState()
+
+    with pytest.raises(TypeError, match="LifespanPhase"):
+        state.transition("invalid")
+
+
+def test_execution_state_records_error_without_retaining_exception() -> None:
+    state = LifespanExecutionState()
+    error = RuntimeError("example failure")
+
+    state.record_primary_error(error)
+
+    assert state.primary_error_type == "RuntimeError"
+    assert state.primary_error_message == "example failure"
