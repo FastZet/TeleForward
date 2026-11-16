@@ -4,11 +4,13 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from datetime import UTC, datetime
 from typing import Any
 
 import pytest
 
 from app.services.scheduling.integration_bootstrap import (
+    BootstrapReport,
     BootstrapState,
     SchedulingBootstrapError,
     SchedulingIntegrationBootstrap,
@@ -185,9 +187,9 @@ async def test_unbound_service_is_not_healthy(
 async def test_not_started_bootstrap_reports_unavailable(
     bootstrap: SchedulingIntegrationBootstrap,
 ) -> None:
-    service = SchedulingBootstrapHealthService(bootstrap)
-
-    report = service.inspect()
+    report = SchedulingBootstrapHealthService(
+        bootstrap
+    ).inspect()
 
     assert report.status is BootstrapHealthStatus.UNAVAILABLE
     assert report.bootstrap_state is BootstrapState.NOT_STARTED
@@ -200,8 +202,9 @@ async def test_successful_bootstrap_reports_healthy(
 ) -> None:
     await bootstrap.bootstrap()
 
-    service = SchedulingBootstrapHealthService(bootstrap)
-    report = service.inspect()
+    report = SchedulingBootstrapHealthService(
+        bootstrap
+    ).inspect()
 
     assert report.status is BootstrapHealthStatus.HEALTHY
     assert report.bootstrap_state is BootstrapState.READY
@@ -209,6 +212,7 @@ async def test_successful_bootstrap_reports_healthy(
     assert report.required_components_available is True
     assert report.validation_passed is True
     assert report.missing_components == ()
+    assert report.cleanup_failures == ()
 
 
 @pytest.mark.asyncio
@@ -280,13 +284,15 @@ async def test_failed_bootstrap_reports_missing_components(
         bootstrap
     ).inspect()
 
-    assert "scheduler_manager" in report.missing_components
-    assert "task_registry" in report.missing_components
-    assert "job_store" in report.missing_components
+    assert report.missing_components == (
+        "scheduler_manager",
+        "task_registry",
+        "job_store",
+    )
 
 
 @pytest.mark.asyncio
-async def test_cleanup_failures_are_reported(
+async def test_bootstrap_failure_records_structured_cleanup_errors(
     components: dict[str, object],
 ) -> None:
     factories = make_factories(components)
@@ -305,15 +311,108 @@ async def test_cleanup_failures_are_reported(
     with pytest.raises(SchedulingBootstrapError):
         await bootstrap.bootstrap()
 
-    report = SchedulingBootstrapHealthService(
+    assert bootstrap.report is not None
+    assert bootstrap.report.cleanup_errors == (
+        "scheduler_manager: manager cleanup failure",
+    )
+
+    health_report = SchedulingBootstrapHealthService(
         bootstrap
     ).inspect()
 
-    assert report.status is BootstrapHealthStatus.FAILED
-    assert report.cleanup_failures
+    assert health_report.status is BootstrapHealthStatus.FAILED
+    assert health_report.cleanup_failures == (
+        "scheduler_manager: manager cleanup failure",
+    )
+
+
+@pytest.mark.asyncio
+async def test_aclose_cleanup_failure_is_reported_structurally(
+    bootstrap: SchedulingIntegrationBootstrap,
+) -> None:
+    await bootstrap.bootstrap()
+
+    # Replace the bootstrap with one that has an explicit failing
+    # cleanup callback for a constructed component.
+    components = dict(bootstrap.components)
+
+    def failing_cleanup(component: object) -> None:
+        raise RuntimeError("job store shutdown failure")
+
+    replacement = SchedulingIntegrationBootstrap(
+        {
+            name: (lambda value=value: value)
+            for name, value in components.items()
+        },
+        cleanup_callbacks={
+            "job_store": failing_cleanup,
+        },
+    )
+
+    await replacement.bootstrap()
+
+    with pytest.raises(SchedulingBootstrapError):
+        await replacement.aclose()
+
+    assert replacement.report is not None
+    assert replacement.report.state is BootstrapState.CLOSED
+    assert replacement.report.cleanup_errors == (
+        "job_store: job store shutdown failure",
+    )
+
+    health_report = SchedulingBootstrapHealthService(
+        replacement
+    ).inspect()
+
+    assert health_report.status is BootstrapHealthStatus.UNAVAILABLE
+    assert health_report.bootstrap_state is BootstrapState.CLOSED
+    assert health_report.cleanup_failures == (
+        "job_store: job store shutdown failure",
+    )
     assert any(
-        "manager cleanup failure" in failure
-        for failure in report.cleanup_failures
+        "Cleanup failures were recorded" in detail
+        for detail in health_report.details
+    )
+
+
+@pytest.mark.asyncio
+async def test_multiple_cleanup_errors_are_preserved(
+    components: dict[str, object],
+) -> None:
+    factories = make_factories(components)
+    factories["task_registry"] = lambda: None
+
+    def failing_manager_cleanup(component: object) -> None:
+        raise RuntimeError("manager failure")
+
+    def failing_store_cleanup(component: object) -> None:
+        raise RuntimeError("store failure")
+
+    bootstrap = SchedulingIntegrationBootstrap(
+        factories,
+        cleanup_callbacks={
+            "scheduler_manager": failing_manager_cleanup,
+            "job_store": failing_store_cleanup,
+        },
+    )
+
+    with pytest.raises(SchedulingBootstrapError):
+        await bootstrap.bootstrap()
+
+    assert bootstrap.report is not None
+
+    assert bootstrap.report.cleanup_errors == (
+        "job_store: store failure",
+        "scheduler_manager: manager failure",
+    )
+
+    health_report = SchedulingBootstrapHealthService(
+        bootstrap
+    ).inspect()
+
+    assert health_report.cleanup_failures == (
+        "job_store: store failure",
+        "scheduler_manager: manager failure",
     )
 
 
@@ -396,7 +495,6 @@ async def test_bind_attaches_bootstrap(
     service = SchedulingBootstrapHealthService()
 
     service.bind(bootstrap)
-
     await bootstrap.bootstrap()
 
     assert service.get_status() is BootstrapHealthStatus.HEALTHY
@@ -409,6 +507,13 @@ def test_bind_rejects_invalid_bootstrap(
         health_service.bind(object())  # type: ignore[arg-type]
 
 
+def test_constructor_rejects_invalid_bootstrap() -> None:
+    with pytest.raises(TypeError):
+        SchedulingBootstrapHealthService(
+            object()  # type: ignore[arg-type]
+        )
+
+
 def test_bootstrap_property_rejects_unbound_service(
     health_service: SchedulingBootstrapHealthService,
 ) -> None:
@@ -419,13 +524,13 @@ def test_bootstrap_property_rejects_unbound_service(
 def test_health_report_serializes_to_dictionary(
     health_service: SchedulingBootstrapHealthService,
 ) -> None:
-    report = health_service.inspect()
-    payload = report.to_dict()
+    payload = health_service.inspect().to_dict()
 
     assert payload["status"] == "unavailable"
     assert payload["bootstrap_state"] == "not_started"
     assert isinstance(payload["available_components"], list)
     assert isinstance(payload["missing_components"], list)
+    assert isinstance(payload["cleanup_failures"], list)
     assert isinstance(payload["checked_at"], str)
 
 
@@ -442,8 +547,6 @@ def test_health_report_contains_json_compatible_values(
 
 
 def test_health_report_rejects_naive_timestamp() -> None:
-    from datetime import datetime
-
     with pytest.raises(ValueError):
         BootstrapHealthReport(
             status=BootstrapHealthStatus.UNAVAILABLE,
@@ -460,8 +563,6 @@ def test_health_report_rejects_naive_timestamp() -> None:
 
 
 def test_health_report_rejects_non_tuple_details() -> None:
-    from datetime import UTC, datetime
-
     with pytest.raises(TypeError):
         BootstrapHealthReport(
             status=BootstrapHealthStatus.UNAVAILABLE,
@@ -477,34 +578,43 @@ def test_health_report_rejects_non_tuple_details() -> None:
         )
 
 
-def test_cleanup_failure_parser_handles_empty_error() -> None:
-    assert (
-        SchedulingBootstrapHealthService._extract_cleanup_failures(
-            None
+def test_health_report_rejects_invalid_cleanup_errors() -> None:
+    with pytest.raises(TypeError):
+        BootstrapReport(
+            state=BootstrapState.FAILED,
+            context_created=False,
+            validation_report=None,
+            cleanup_errors=["invalid"],  # type: ignore[arg-type]
         )
-        == ()
-    )
 
 
-def test_cleanup_failure_parser_handles_missing_marker() -> None:
-    assert (
-        SchedulingBootstrapHealthService._extract_cleanup_failures(
-            "ordinary bootstrap failure"
+def test_health_report_rejects_invalid_status() -> None:
+    with pytest.raises(TypeError):
+        BootstrapHealthReport(
+            status="invalid",  # type: ignore[arg-type]
+            bootstrap_state=BootstrapState.NOT_STARTED,
+            context_available=False,
+            required_components_available=False,
+            available_components=(),
+            missing_components=(),
+            validation_passed=None,
+            cleanup_failures=(),
+            checked_at=datetime.now(UTC),
+            details=(),
         )
-        == ()
-    )
 
 
-def test_cleanup_failure_parser_extracts_multiple_failures() -> None:
-    result = (
-        SchedulingBootstrapHealthService._extract_cleanup_failures(
-            "bootstrap failed; cleanup failures: "
-            "scheduler_manager: manager failed; "
-            "job_store: store failed"
+def test_health_report_rejects_non_string_cleanup_entries() -> None:
+    with pytest.raises(TypeError):
+        BootstrapHealthReport(
+            status=BootstrapHealthStatus.FAILED,
+            bootstrap_state=BootstrapState.FAILED,
+            context_available=False,
+            required_components_available=False,
+            available_components=(),
+            missing_components=(),
+            validation_passed=None,
+            cleanup_failures=(123,),  # type: ignore[arg-type]
+            checked_at=datetime.now(UTC),
+            details=(),
         )
-    )
-
-    assert result == (
-        "scheduler_manager: manager failed",
-        "job_store: store failed",
-    )
