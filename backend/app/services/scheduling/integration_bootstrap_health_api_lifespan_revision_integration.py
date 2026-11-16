@@ -1,8 +1,13 @@
 
-"""Hardened integrated scheduler health API lifespan.
+"""Observable and cancellation-aware integrated scheduler health lifespan.
 
-Provides explicit lifecycle tracking, exception preservation, and
-cancellation-aware cleanup for the bootstrap health API integration.
+Provides:
+- Explicit lifecycle phase tracking.
+- Existing application lifespan composition.
+- Bootstrap health API installation.
+- Cancellation-aware cleanup.
+- Primary exception preservation.
+- Structured cleanup diagnostics.
 """
 
 from __future__ import annotations
@@ -12,7 +17,8 @@ import inspect
 import logging
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from enum import StrEnum
 from types import TracebackType
 from typing import Any
@@ -38,6 +44,10 @@ from app.services.scheduling.integration_bootstrap_health_api_lifespan_revision 
 )
 
 logger = logging.getLogger(__name__)
+
+LIFESPAN_EXECUTION_STATE_KEY = (
+    "scheduler_bootstrap_health_lifespan_execution"
+)
 
 
 class BootstrapHealthLifespanIntegrationError(RuntimeError):
@@ -70,7 +80,7 @@ class BootstrapHealthLifespanShutdownError(RuntimeError):
 
 
 class LifespanPhase(StrEnum):
-    """Observable phases of the integrated lifespan."""
+    """Observable phases of one lifespan execution."""
 
     INITIALISING = "initialising"
     EXISTING_LIFESPAN_ENTERED = "existing_lifespan_entered"
@@ -83,18 +93,38 @@ class LifespanPhase(StrEnum):
 
 @dataclass(slots=True)
 class LifespanExecutionState:
-    """Internal state for one lifespan execution."""
+    """Observable state for one integrated lifespan execution."""
 
     phase: LifespanPhase = LifespanPhase.INITIALISING
+    phase_history: list[tuple[LifespanPhase, datetime]] = field(
+        default_factory=list
+    )
     existing_context_entered: bool = False
     integration_installed: bool = False
-    primary_error: BaseException | None = None
-    primary_traceback: TracebackType | None = None
     exception_suppressed: bool = False
+    primary_error_type: str | None = None
+    primary_error_message: str | None = None
+    cleanup_report: CleanupReport | None = None
 
-    def set_primary_error(self, error: BaseException) -> None:
-        self.primary_error = error
-        self.primary_traceback = error.__traceback__
+    def __post_init__(self) -> None:
+        self.transition(self.phase)
+
+    def transition(self, phase: LifespanPhase) -> None:
+        """Record a lifecycle transition."""
+
+        if not isinstance(phase, LifespanPhase):
+            raise TypeError("phase must be a LifespanPhase")
+
+        self.phase = phase
+        self.phase_history.append(
+            (phase, datetime.now(timezone.utc))
+        )
+
+    def record_primary_error(self, error: BaseException) -> None:
+        """Record primary exception information without retaining its object."""
+
+        self.primary_error_type = type(error).__name__
+        self.primary_error_message = str(error)
 
 
 async def _invoke_callback(
@@ -191,6 +221,19 @@ def _validate_arguments(
         raise TypeError("lifespan callbacks must be callable")
 
 
+def _publish_state(
+    app: FastAPI,
+    state: LifespanExecutionState,
+) -> None:
+    """Publish the current execution state on app.state."""
+
+    setattr(
+        app.state,
+        LIFESPAN_EXECUTION_STATE_KEY,
+        state,
+    )
+
+
 def _attach_cleanup_diagnostics(
     primary_error: BaseException,
     report: CleanupReport,
@@ -234,21 +277,13 @@ def _attach_cleanup_diagnostics(
     )
 
 
-async def _exit_existing_lifespan(
-    context: Any,
+def _record_report(
     state: LifespanExecutionState,
+    report: CleanupReport | None,
 ) -> None:
-    """Exit the existing lifespan and record suppression semantics."""
+    """Retain the final cleanup report."""
 
-    error = state.primary_error
-
-    result = await context.__aexit__(
-        type(error) if error is not None else None,
-        error,
-        state.primary_traceback if error is not None else None,
-    )
-
-    state.exception_suppressed = bool(result)
+    state.cleanup_report = report
 
 
 def create_integrated_bootstrap_health_lifespan(
@@ -260,22 +295,23 @@ def create_integrated_bootstrap_health_lifespan(
     before_shutdown: LifespanCallback | None = None,
     after_shutdown: LifespanCallback | None = None,
 ) -> LifespanFactory:
-    """Create the integrated bootstrap health API lifespan.
+    """Create the observable integrated bootstrap health API lifespan.
 
-    Startup:
+    Startup order:
         1. Resolve and enter the existing lifespan.
         2. Execute before_start.
         3. Install or reuse the health API integration.
         4. Execute after_start.
-        5. Yield control to FastAPI.
+        5. Enter RUNNING.
 
-    Shutdown:
+    Shutdown order:
         1. Execute before_shutdown if integration was installed.
         2. Execute after_shutdown if integration was installed.
         3. Exit the existing lifespan if successfully entered.
 
-    A primary cancellation is never suppressed by an existing lifespan.
-    Ordinary exceptions may be suppressed by the existing lifespan.
+    Cancellation takes precedence over ordinary cleanup failures.
+    Existing lifespan suppression applies only to ordinary exceptions,
+    never to the primary application cancellation.
     """
 
     _validate_arguments(
@@ -295,7 +331,11 @@ def create_integrated_bootstrap_health_lifespan(
             raise TypeError("app must be a FastAPI instance")
 
         state = LifespanExecutionState()
+        _publish_state(app, state)
+
         existing_context: Any | None = None
+        primary_error: BaseException | None = None
+        primary_traceback: TracebackType | None = None
 
         try:
             if existing_lifespan is not None:
@@ -304,10 +344,12 @@ def create_integrated_bootstrap_health_lifespan(
                     app,
                 )
 
-                # Mark ownership only after successful entry.
                 await existing_context.__aenter__()
                 state.existing_context_entered = True
-                state.phase = LifespanPhase.EXISTING_LIFESPAN_ENTERED
+                state.transition(
+                    LifespanPhase.EXISTING_LIFESPAN_ENTERED
+                )
+                _publish_state(app, state)
 
             await _invoke_callback(before_start, app)
 
@@ -322,19 +364,25 @@ def create_integrated_bootstrap_health_lifespan(
                 )
 
             state.integration_installed = True
-            state.phase = LifespanPhase.INTEGRATION_INSTALLED
+            state.transition(LifespanPhase.INTEGRATION_INSTALLED)
+            _publish_state(app, state)
 
             await _invoke_callback(after_start, app)
 
-            state.phase = LifespanPhase.RUNNING
+            state.transition(LifespanPhase.RUNNING)
+            _publish_state(app, state)
 
             yield
 
         except BaseException as exc:
-            state.set_primary_error(exc)
-            state.phase = LifespanPhase.FAILED
+            primary_error = exc
+            primary_traceback = exc.__traceback__
+            state.record_primary_error(exc)
+            state.transition(LifespanPhase.FAILED)
+            _publish_state(app, state)
 
-        state.phase = LifespanPhase.CLEANING_UP
+        state.transition(LifespanPhase.CLEANING_UP)
+        _publish_state(app, state)
 
         operations: list[tuple[str, Callable[[], Any]]] = []
 
@@ -353,13 +401,20 @@ def create_integrated_bootstrap_health_lifespan(
             )
 
         if state.existing_context_entered and existing_context is not None:
+
+            async def exit_existing_lifespan() -> None:
+                result = await existing_context.__aexit__(
+                    type(primary_error) if primary_error is not None else None,
+                    primary_error,
+                    primary_traceback,
+                )
+
+                state.exception_suppressed = bool(result)
+
             operations.append(
                 (
                     "existing_lifespan_exit",
-                    lambda: _exit_existing_lifespan(
-                        existing_context,
-                        state,
-                    ),
+                    exit_existing_lifespan,
                 )
             )
 
@@ -368,37 +423,75 @@ def create_integrated_bootstrap_health_lifespan(
         if operations:
             report = await execute_cleanup_resiliently(operations)
 
-        primary_error = state.primary_error
+        _record_report(state, report)
+        _publish_state(app, state)
 
+        # Primary cancellation always wins, even if the existing lifespan
+        # attempts to suppress it.
         if isinstance(primary_error, asyncio.CancelledError):
             if report is not None:
                 _attach_cleanup_diagnostics(primary_error, report)
 
-            state.phase = LifespanPhase.STOPPED
-            raise primary_error.with_traceback(state.primary_traceback)
+            state.transition(LifespanPhase.STOPPED)
+            _publish_state(app, state)
 
+            raise primary_error.with_traceback(primary_traceback)
+
+        # Preserve an unsuppressed primary exception.
         if primary_error is not None and not state.exception_suppressed:
             if report is not None:
                 _attach_cleanup_diagnostics(primary_error, report)
 
-            state.phase = LifespanPhase.FAILED
-            raise primary_error.with_traceback(state.primary_traceback)
+            state.transition(LifespanPhase.FAILED)
+            _publish_state(app, state)
 
-        if report is not None:
-            if report.cancellation is not None:
-                state.phase = LifespanPhase.STOPPED
-                raise CleanupCancelledError(report) from report.cancellation
+            raise primary_error.with_traceback(primary_traceback)
 
-            if report.failures:
-                state.phase = LifespanPhase.FAILED
+        # If the existing lifespan suppressed the primary exception,
+        # cleanup cancellation must still propagate.
+        if report is not None and report.cancellation is not None:
+            state.transition(LifespanPhase.STOPPED)
+            _publish_state(app, state)
 
-                raise BootstrapHealthLifespanShutdownError(
-                    report
-                ) from report.failures[0].error
+            raise CleanupCancelledError(report) from report.cancellation
 
-        state.phase = LifespanPhase.STOPPED
+        if report is not None and report.failures:
+            state.transition(LifespanPhase.FAILED)
+            _publish_state(app, state)
+
+            raise BootstrapHealthLifespanShutdownError(
+                report
+            ) from report.failures[0].error
+
+        state.transition(LifespanPhase.STOPPED)
+        _publish_state(app, state)
 
     return lifespan
+
+
+def get_lifespan_execution_state(
+    app: FastAPI,
+) -> LifespanExecutionState | None:
+    """Return the latest lifespan execution state, if available."""
+
+    if not isinstance(app, FastAPI):
+        raise TypeError("app must be a FastAPI instance")
+
+    state = getattr(
+        app.state,
+        LIFESPAN_EXECUTION_STATE_KEY,
+        None,
+    )
+
+    if state is not None and not isinstance(
+        state,
+        LifespanExecutionState,
+    ):
+        raise BootstrapHealthLifespanIntegrationError(
+            "Stored lifespan execution state has an invalid type"
+        )
+
+    return state
 
 
 def install_integrated_bootstrap_health_lifespan(
