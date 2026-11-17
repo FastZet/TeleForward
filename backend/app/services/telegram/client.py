@@ -15,6 +15,7 @@ from pathlib import Path
 
 import structlog
 from telethon import TelegramClient
+from telethon.sessions import StringSession
 
 
 logger = structlog.get_logger(__name__)
@@ -77,12 +78,14 @@ class TelegramClientManager:
         account_id: int,
         api_id: int,
         api_hash: str,
+        session_string: str | None = None,
     ) -> TelegramClient:
-        """Construct a Telethon client without connecting it."""
-        session_path = self.session_dir / f"account_{account_id}"
+        """Construct a client with an in-memory Telethon session."""
+        self._prepare_session_directory()
+        session = StringSession(session_string or "")
 
         client = TelegramClient(
-            str(session_path),
+            session,
             api_id=api_id,
             api_hash=api_hash,
             connection_retries=self.connection_retries,
@@ -101,6 +104,7 @@ class TelegramClientManager:
         api_hash: str,
         *,
         connect: bool = True,
+        session_string: str | None = None,
     ) -> TelegramClient:
         """
         Retrieve an existing client or create a new one.
@@ -134,12 +138,11 @@ class TelegramClientManager:
             client = self._clients.get(account_id)
 
             if client is None:
-                self._prepare_session_directory()
-
                 client = self._create_client(
                     account_id=account_id,
                     api_id=api_id,
                     api_hash=api_hash,
+                    session_string=session_string,
                 )
 
                 self._clients[account_id] = client
@@ -176,6 +179,19 @@ class TelegramClientManager:
                 )
 
             return client
+
+    async def export_session(self, account_id: int) -> str | None:
+        """Export a managed client's authorization as a StringSession."""
+        async with self._lock:
+            client = self._clients.get(account_id)
+            if client is None:
+                return None
+            exported = StringSession.save(client.session)
+            return exported or None
+
+    def get_managed_client(self, account_id: int) -> TelegramClient | None:
+        """Return an existing client without creating or connecting it."""
+        return self._clients.get(account_id)
 
     async def disconnect(self, account_id: int) -> None:
         """Disconnect and remove a client's in-memory instance."""
@@ -226,3 +242,4 @@ class TelegramClientManager:
     def get_managed_account_ids(self) -> list[int]:
         """Return the IDs of accounts currently managed in memory."""
         return list(self._clients.keys())
+
