@@ -207,7 +207,11 @@ async def _start_background_processing(
     worker = ProcessingQueueWorker(
         session_factory,
         worker_id=f"{os.getpid()}-{secrets.token_hex(8)}",
-        handlers={QueueJobType.FORWARD_MESSAGE: handlers.forward_message},
+        handlers={
+            QueueJobType.FORWARD_MESSAGE: handlers.forward_message,
+            QueueJobType.SYNC_EDIT: handlers.sync_message_edit,
+            QueueJobType.SYNC_DELETE: handlers.sync_message_delete,
+        },
     )
     updates = TelegramUpdatesService(client_manager)
     ingestion = TelegramUpdateIngestionService(session_factory)
