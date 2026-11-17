@@ -8,6 +8,10 @@ from typing import Any
 from app.services.scheduling.cleanup import (
     SchedulingCleanupService,
 )
+from app.services.scheduling.history import ExecutionHistoryRepository
+from app.services.scheduling.history_tracking import (
+    HistoryTrackingScheduledTask,
+)
 from app.services.scheduling.tasks.backfill import (
     BackfillScheduledTask,
 )
@@ -66,6 +70,7 @@ class ScheduledTaskFactory:
             str,
             Callable[[], Awaitable[Mapping[str, Any]]],
         ],
+        history_repository: ExecutionHistoryRepository | None = None,
     ) -> None:
         self._cleanup_service = cleanup_service
         self._backup_operation = backup_operation
@@ -79,6 +84,7 @@ class ScheduledTaskFactory:
         self._forwarding_operation = forwarding_operation
         self._backfill_operation = backfill_operation
         self._health_checks = dict(health_checks)
+        self._history_repository = history_repository
 
         self._validate_dependencies()
 
@@ -115,10 +121,22 @@ class ScheduledTaskFactory:
                 "At least one health check must be configured"
             )
 
+        if (
+            self._history_repository is not None
+            and not isinstance(
+                self._history_repository,
+                ExecutionHistoryRepository,
+            )
+        ):
+            raise TypeError(
+                "history_repository must be an "
+                "ExecutionHistoryRepository or None"
+            )
+
     def build(self) -> tuple[BaseScheduledTask, ...]:
         """Construct all configured scheduled task instances."""
 
-        return (
+        tasks: tuple[BaseScheduledTask, ...] = (
             CleanupScheduledTask(self._cleanup_service),
             HealthCheckScheduledTask(self._health_checks),
             BackupScheduledTask(self._backup_operation),
@@ -133,6 +151,14 @@ class ScheduledTaskFactory:
             ),
             ForwardingScheduledTask(self._forwarding_operation),
             BackfillScheduledTask(self._backfill_operation),
+        )
+
+        if self._history_repository is None:
+            return tasks
+
+        return tuple(
+            HistoryTrackingScheduledTask(task, self._history_repository)
+            for task in tasks
         )
 
     def register(
