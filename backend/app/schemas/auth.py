@@ -151,7 +151,7 @@ class AuthenticationUserResponse(ResponseSchema):
 
     id: int
     username: str
-    email: EmailStr
+    email: EmailStr | None = None
     display_name: str | None = None
     is_active: bool
     is_superuser: bool
@@ -178,3 +178,16 @@ class LogoutResponse(ResponseSchema):
 
     authenticated: bool = False
     message: str = "Successfully logged out."
+
+
+class InitialSetupStatusResponse(ResponseSchema):
+    """Whether the first administrator account can still be created."""
+
+    setup_required: bool
+
+
+class CSRFTokenResponse(ResponseSchema):
+    """CSRF token paired with the signed CSRF cookie."""
+
+    csrf_token: str
+
