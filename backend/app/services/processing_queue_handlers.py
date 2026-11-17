@@ -77,7 +77,10 @@ class ProcessingQueueHandlers:
             message = await session.get(Message, job.message_id)
             if rule is None or message is None:
                 raise ForwardingJobError("Forwarding rule or message was not found")
-            if not rule.is_enabled:
+            if (
+                not rule.is_enabled
+                or message.processing_status.value == "deleted"
+            ):
                 return
 
             source_chat = await session.get(TelegramChat, rule.source_chat_id)
