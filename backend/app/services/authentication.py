@@ -81,7 +81,9 @@ class AuthenticationService:
     async def authenticate(self, username: str, password: str) -> User | None:
         """Verify credentials; return ``None`` for every denied login."""
         user = await self._session.scalar(
-            select(User).where(User.username == username)
+            select(User)
+            .where(User.username == username)
+            .with_for_update()
         )
         now = datetime.now(UTC)
         locked_until = user.locked_until if user is not None else None
