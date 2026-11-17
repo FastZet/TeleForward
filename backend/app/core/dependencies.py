@@ -15,9 +15,11 @@ from collections.abc import AsyncIterator
 from typing import Annotated, Any
 
 from fastapi import Depends, HTTPException, Request, status
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import Settings, get_settings
+from app.core.security import decode_access_token
 from app.database.session import get_session
 from app.models.user import User
 
@@ -39,14 +41,93 @@ async def get_database_session() -> AsyncIterator[AsyncSession]:
         yield session
 
 
-async def get_current_user(request: Request) -> User:
-    """
-    Retrieve the authenticated user from request state.
+async def _resolve_current_user(
+    request: Request,
+    session: AsyncSession,
+) -> User | None:
+    """Resolve the user from trusted request state or a signed session."""
+    existing_user = getattr(request.state, "current_user", None)
+    if existing_user is not None:
+        if not isinstance(existing_user, User):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail={
+                    "code": "INVALID_AUTHENTICATION_CONTEXT",
+                    "message": "The authentication context is invalid.",
+                },
+            )
+        if not existing_user.is_active:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail={
+                    "code": "ACCOUNT_DISABLED",
+                    "message": "This account is disabled.",
+                },
+            )
+        return existing_user
 
-    Authentication middleware or an authentication dependency
-    must populate request.state.current_user.
+    settings = get_settings()
+    authorization = request.headers.get("Authorization")
+    token: str | None = None
+    if authorization:
+        scheme, separator, credentials = authorization.partition(" ")
+        if (
+            not separator
+            or scheme.lower() != "bearer"
+            or not credentials.strip()
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail={
+                    "code": "INVALID_AUTHENTICATION",
+                    "message": "The authentication token is invalid.",
+                },
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        token = credentials.strip()
+    else:
+        token = request.cookies.get(settings.session_cookie_name)
+
+    if not token:
+        return None
+
+    try:
+        claims = decode_access_token(token)
+        user_id = int(claims["sub"])
+        if user_id <= 0:
+            raise ValueError("invalid subject")
+    except (KeyError, TypeError, ValueError):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail={
+                "code": "INVALID_AUTHENTICATION",
+                "message": "The authentication token is invalid or expired.",
+            },
+            headers={"WWW-Authenticate": "Bearer"},
+        ) from None
+
+    user = await session.scalar(select(User).where(User.id == user_id))
+    if user is None:
+        return None
+    if not user.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={"code": "ACCOUNT_DISABLED", "message": "This account is disabled."},
+        )
+    return user
+
+
+async def get_current_user(
+    request: Request,
+    session: AsyncSession = Depends(get_database_session),
+) -> User:
     """
-    user = getattr(request.state, "current_user", None)
+    Resolve the authenticated user from request state or a signed token.
+
+    Browser clients use the HttpOnly session cookie; API clients may
+    supply the same signed token as a bearer credential.
+    """
+    user = await _resolve_current_user(request, session)
 
     if user is None:
         raise HTTPException(
@@ -81,6 +162,7 @@ async def get_current_user(request: Request) -> User:
 
 async def get_optional_current_user(
     request: Request,
+    session: AsyncSession = Depends(get_database_session),
 ) -> User | None:
     """
     Retrieve the authenticated user when one is available.
@@ -88,7 +170,7 @@ async def get_optional_current_user(
     Unlike get_current_user(), this dependency does not reject
     unauthenticated requests.
     """
-    user = getattr(request.state, "current_user", None)
+    user = await _resolve_current_user(request, session)
 
     if user is None:
         return None
@@ -182,3 +264,4 @@ ApplicationReady = Annotated[
     None,
     Depends(require_application_ready),
 ]
+
