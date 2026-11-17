@@ -19,8 +19,9 @@ from app.core.config import get_settings
 from app.core.exceptions import DatabaseError
 from app.database.base import Base
 from app.database.engine import get_database_engine
-from app.database.session import clear_session_factory_cache
+from app.database.session import clear_session_factory
 import app.models  # noqa: F401 - register all ORM models
+import app.services.scheduling.persistence  # noqa: F401 - register scheduled-job model
 
 
 logger = logging.getLogger(__name__)
@@ -181,7 +182,7 @@ async def initialise_database(
     logger.info("Initialising TeleForward database.")
 
     # Ensure cached session factories are recreated if necessary.
-    clear_session_factory_cache()
+    clear_session_factory()
 
     settings = get_settings()
 
@@ -212,7 +213,7 @@ async def shutdown_database() -> None:
     logger.info("Shutting down database connections.")
 
     try:
-        clear_session_factory_cache()
+        clear_session_factory()
         await dispose_database_engine()
 
         logger.info("Database connections closed.")
@@ -223,3 +224,4 @@ async def shutdown_database() -> None:
         raise DatabaseError(
             "Unable to shut down database connections cleanly."
         ) from exc
+
