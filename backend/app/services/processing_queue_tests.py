@@ -19,6 +19,7 @@ from app.services.processing_queue import (
     ProcessingQueueService,
     QueueLeaseError,
 )
+from app.services.processing_queue_worker import ProcessingQueueWorker
 
 QueueScenario = Callable[[ProcessingQueueService], Awaitable[None]]
 
@@ -46,6 +47,52 @@ async def _run_scenario(
             await scenario(
                 ProcessingQueueService(session, **(queue_options or {}))
             )
+    finally:
+        await engine.dispose()
+
+
+async def _run_worker_scenario(
+    handler: Callable,
+    *,
+    job_type: QueueJobType = QueueJobType.PROCESS_MESSAGE,
+    lease_duration: timedelta = timedelta(minutes=2),
+    heartbeat_interval: float = 30.0,
+) -> tuple[QueueJobStatus, int, str | None]:
+    engine = create_async_engine(_database_url())
+    try:
+        async with engine.begin() as connection:
+            await connection.run_sync(
+                lambda sync_connection: Base.metadata.create_all(
+                    bind=sync_connection,
+                    tables=[ProcessingQueue.__table__],
+                )
+            )
+        session_factory = async_sessionmaker(
+            engine,
+            expire_on_commit=False,
+        )
+        async with session_factory() as session:
+            queue = ProcessingQueueService(session)
+            queued, _ = await queue.enqueue(
+                job_type,
+                {"message_id": 42},
+            )
+            job_id = queued.id
+            await session.commit()
+
+        worker = ProcessingQueueWorker(
+            session_factory,
+            worker_id="worker-test",
+            handlers={job_type: handler},
+            lease_duration=lease_duration,
+            heartbeat_interval=heartbeat_interval,
+        )
+        assert await worker.run_once() is True
+
+        async with session_factory() as session:
+            job = await session.get(ProcessingQueue, job_id)
+            assert job is not None
+            return job.status, job.attempts, job.last_error
     finally:
         await engine.dispose()
 
@@ -204,4 +251,32 @@ def test_release_worker_makes_lease_immediately_available():
         assert next_claim.id == claimed.id
 
     asyncio.run(_run_scenario(_database_url(), scenario))
+
+
+def test_worker_dispatches_job_and_renews_long_running_lease():
+    received: list[int] = []
+
+    async def handler(job) -> None:
+        received.append(job.payload["message_id"])
+        await asyncio.sleep(0.06)
+
+    result = asyncio.run(
+        _run_worker_scenario(
+            handler,
+            lease_duration=timedelta(seconds=0.2),
+            heartbeat_interval=0.03,
+        )
+    )
+
+    assert received == [42]
+    assert result == (QueueJobStatus.COMPLETED, 1, None)
+
+
+def test_worker_records_failure_without_storing_exception_details():
+    async def handler(_job) -> None:
+        raise RuntimeError("sensitive error detail")
+
+    result = asyncio.run(_run_worker_scenario(handler))
+
+    assert result == (QueueJobStatus.PENDING, 1, "RuntimeError")
 
