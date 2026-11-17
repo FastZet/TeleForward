@@ -40,6 +40,8 @@ SUPPORTED_FIELDS = frozenset({
     "caption",
     "media_type",
     "has_media",
+    "has_text",
+    "has_link",
     "has_photo",
     "has_video",
     "has_document",
@@ -306,3 +308,4 @@ def validate_filter_configuration(
             for condition in group.conditions
         ],
     }
+
