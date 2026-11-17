@@ -196,17 +196,20 @@ class ProcessingQueueHandlers:
                 )
 
             options = self._validated_options(rule.settings)
-            transformed_text, has_transformations = await self._transform_content(
-                rule.settings,
-                message,
-                source_chat,
-            )
-            if has_transformations and (
-                rule.mode == ForwardingMode.FORWARD
-                or len(grouped_messages) > 1
-            ):
+            transformed_texts: list[str] = []
+            has_transformations = False
+            for grouped_message in grouped_messages:
+                transformed_text, has_transform = await self._transform_content(
+                    rule.settings,
+                    grouped_message,
+                    source_chat,
+                )
+                if has_transform:
+                    has_transformations = True
+                    transformed_texts.append(transformed_text or "")
+            if has_transformations and rule.mode == ForwardingMode.FORWARD:
                 raise ForwardingJobError(
-                    "Configured transformations currently require COPY mode and a single message"
+                    "Configured transformations require COPY mode"
                 )
             for delivery in deliveries:
                 delivery.delivery_status = DeliveryStatus.PROCESSING
@@ -230,7 +233,9 @@ class ProcessingQueueHandlers:
                     messages=grouped_messages,
                     telegram_message_ids=telegram_ids,
                     options=options,
-                    transformed_text=transformed_text,
+                    transformed_texts=(
+                        transformed_texts if has_transformations else None
+                    ),
                     has_transformations=has_transformations,
                 )
                 if len(destination_ids) != len(grouped_messages):
@@ -366,7 +371,7 @@ class ProcessingQueueHandlers:
         messages: list[Message],
         telegram_message_ids: list[int],
         options: dict[str, bool],
-        transformed_text: str | None = None,
+        transformed_texts: list[str] | None = None,
         has_transformations: bool = False,
     ) -> tuple[int, ...]:
         if rule.mode == ForwardingMode.FORWARD:
@@ -399,7 +404,14 @@ class ProcessingQueueHandlers:
                 destination_chat_id=destination_chat_id,
                 message_ids=telegram_message_ids,
                 silent=options["silent"],
-                formatting_entities=options["formatting_entities"],
+                formatting_entities=(
+                    options["formatting_entities"] and not has_transformations
+                ),
+                caption_overrides=(
+                    dict(zip(telegram_message_ids, transformed_texts, strict=True))
+                    if transformed_texts is not None
+                    else None
+                ),
             )
             return result.destination_message_ids
 
@@ -414,7 +426,11 @@ class ProcessingQueueHandlers:
             formatting_entities=(
                 options["formatting_entities"] and not has_transformations
             ),
-            text_override=transformed_text,
+            text_override=(
+                transformed_texts[0]
+                if transformed_texts is not None
+                else None
+            ),
         )
         return result.destination_message_ids
 
