@@ -217,6 +217,24 @@ class ProcessingQueueService:
         await self._session.flush()
         return job
 
+    async def extend_lease(
+        self,
+        job_id: int,
+        worker_id: str,
+        *,
+        lease_duration: timedelta = timedelta(minutes=2),
+        now: datetime | None = None,
+    ) -> ProcessingQueue:
+        """Renew a current worker lease before it expires."""
+        if lease_duration <= timedelta(0):
+            raise ValueError("lease_duration must be positive")
+        current_time = now or datetime.now(timezone.utc)
+        self._validate_aware(current_time, "now")
+        job = await self._owned_job(job_id, worker_id, current_time)
+        job.locked_until = current_time + lease_duration
+        await self._session.flush()
+        return job
+
     async def fail(
         self,
         job_id: int,
