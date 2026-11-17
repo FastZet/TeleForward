@@ -14,7 +14,7 @@ from app.models.chat import TelegramChat
 from app.models.filter_rule import FilterRule
 from app.models.forwarded_message import DeliveryStatus, ForwardedMessage
 from app.models.forwarding_rule import ForwardingMode, ForwardingRule
-from app.models.message import Message
+from app.models.message import Message, MessageType
 from app.models.processing_queue import (
     ProcessingQueue,
     QueueJobStatus,
@@ -30,6 +30,15 @@ from app.services.telegram.credentials import TelegramCredentialsService
 from app.services.telegram.forwarding import TelegramForwardingService
 from app.services.telegram.edit import TelegramEditService
 from app.services.telegram.delete import TelegramDeleteService
+from app.services.transformations.base import (
+    TransformationInput,
+    TransformationStatus,
+)
+from app.services.transformations.engine import TransformationEngine
+from app.services.transformations.prefix_suffix import PrefixSuffixTransformation
+from app.services.transformations.registry import TransformationRegistry
+from app.services.transformations.replace import ReplaceTransformation
+from app.services.transformations.text import TextTransformation
 
 
 class ForwardingJobError(RuntimeError):
@@ -187,7 +196,18 @@ class ProcessingQueueHandlers:
                 )
 
             options = self._validated_options(rule.settings)
-            self._reject_unimplemented_transformations(rule.settings)
+            transformed_text, has_transformations = await self._transform_content(
+                rule.settings,
+                message,
+                source_chat,
+            )
+            if has_transformations and (
+                rule.mode == ForwardingMode.FORWARD
+                or len(grouped_messages) > 1
+            ):
+                raise ForwardingJobError(
+                    "Configured transformations currently require COPY mode and a single message"
+                )
             for delivery in deliveries:
                 delivery.delivery_status = DeliveryStatus.PROCESSING
                 delivery.retry_count += 1
@@ -210,6 +230,8 @@ class ProcessingQueueHandlers:
                     messages=grouped_messages,
                     telegram_message_ids=telegram_ids,
                     options=options,
+                    transformed_text=transformed_text,
+                    has_transformations=has_transformations,
                 )
                 if len(destination_ids) != len(grouped_messages):
                     raise ForwardingJobError(
@@ -344,6 +366,8 @@ class ProcessingQueueHandlers:
         messages: list[Message],
         telegram_message_ids: list[int],
         options: dict[str, bool],
+        transformed_text: str | None = None,
+        has_transformations: bool = False,
     ) -> tuple[int, ...]:
         if rule.mode == ForwardingMode.FORWARD:
             results = await self._forwarder.forward_messages(
@@ -387,9 +411,90 @@ class ProcessingQueueHandlers:
             destination_chat_id=destination_chat_id,
             message_id=telegram_message_ids[0],
             silent=options["silent"],
-            formatting_entities=options["formatting_entities"],
+            formatting_entities=(
+                options["formatting_entities"] and not has_transformations
+            ),
+            text_override=transformed_text,
         )
         return result.destination_message_ids
+
+    async def _transform_content(
+        self,
+        settings: Any,
+        message: Message,
+        source_chat: TelegramChat,
+    ) -> tuple[str | None, bool]:
+        """Run the allowlisted message transformation pipeline, if configured."""
+        specifications = settings.get("transformations", [])
+        if not specifications:
+            return None, False
+        if not isinstance(specifications, list) or len(specifications) > 20:
+            raise ForwardingJobError(
+                "Transformations must be a list of at most 20 entries"
+            )
+        constructors = {
+            "text": TextTransformation,
+            "prefix_suffix": PrefixSuffixTransformation,
+            "replace": ReplaceTransformation,
+        }
+        registry = TransformationRegistry()
+        names: list[str] = []
+        for spec in specifications:
+            if not isinstance(spec, Mapping) or set(spec) - {"name", "options"}:
+                raise ForwardingJobError("Transformation configuration is invalid")
+            name = spec.get("name")
+            options = spec.get("options", {})
+            if not isinstance(name, str) or name not in constructors:
+                raise ForwardingJobError("Transformation name is unsupported")
+            if not isinstance(options, Mapping):
+                raise ForwardingJobError("Transformation options must be a mapping")
+            if name in names:
+                raise ForwardingJobError("Duplicate transformations are not allowed")
+            try:
+                transformation = constructors[name](**dict(options))
+                registry.register(transformation)
+            except (TypeError, ValueError) as exc:
+                raise ForwardingJobError(
+                    "Transformation configuration is invalid"
+                ) from exc
+            names.append(name)
+
+        media_type = None
+        if isinstance(message.media_metadata, Mapping):
+            raw_media_type = message.media_metadata.get("media_type")
+            if isinstance(raw_media_type, str):
+                media_type = raw_media_type
+        transformation_input = TransformationInput(
+            message_id=message.telegram_message_id,
+            account_id=message.telegram_account_id,
+            chat_id=message.source_chat_id,
+            text=message.text or "",
+            caption=message.caption or "",
+            media_type=media_type,
+            sender_id=(
+                message.sender_id
+                if message.sender_id is not None and message.sender_id > 0
+                else None
+            ),
+            metadata={
+                "source_chat_id": source_chat.telegram_chat_id,
+                "source_chat_title": source_chat.title,
+                "source_message_id": message.telegram_message_id,
+                "source_date": message.telegram_date.isoformat(),
+            },
+        )
+        summary = await TransformationEngine(registry).execute(
+            transformation_input,
+            transformation_names=names,
+        )
+        if summary.status == TransformationStatus.FAILED:
+            raise ForwardingJobError("Message transformation failed")
+        return (
+            summary.transformed_text
+            if message.message_type == MessageType.TEXT
+            else summary.transformed_caption,
+            True,
+        )
 
     async def _load_delivery_rows(
         self,
@@ -597,11 +702,4 @@ class ProcessingQueueHandlers:
             defaults[name] = value
         return defaults
 
-    @staticmethod
-    def _reject_unimplemented_transformations(settings: Any) -> None:
-        transformations = settings.get("transformations", [])
-        if transformations:
-            raise ForwardingJobError(
-                "Configured message transformations are not supported by this handler"
-            )
 
