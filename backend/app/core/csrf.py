@@ -16,6 +16,7 @@ from typing import Iterable
 from urllib.parse import urlparse
 
 from fastapi import Request
+from pydantic import SecretStr
 from starlette.datastructures import Headers
 from starlette.responses import JSONResponse, Response
 from starlette.types import ASGIApp, Receive, Scope, Send
@@ -58,7 +59,14 @@ def _get_signing_key() -> bytes:
             "Application secret key is not configured"
         )
 
-    return secret.encode("utf-8")
+    if isinstance(secret, SecretStr):
+        secret_value = secret.get_secret_value()
+    elif isinstance(secret, str):
+        secret_value = secret
+    else:
+        raise RuntimeError("Application secret key must be a string")
+
+    return secret_value.encode("utf-8")
 
 
 def _sign_token(token: str) -> str:
@@ -351,3 +359,4 @@ def set_csrf_cookie(
     )
 
     return csrf_token
+
