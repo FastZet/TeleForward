@@ -2,13 +2,18 @@
 
 from __future__ import annotations
 
+import logging
+
 from fastapi import APIRouter, Depends, HTTPException, Request, status
+from sqlalchemy import select
 from telethon.errors import SessionPasswordNeededError
 
 from app.core.dependencies import DatabaseSession, get_current_superuser
 from app.core.rate_limiter import limiter
 from app.core.security import encrypt_value
 from app.models.telegram_account import TelegramAccount, TelegramAccountStatus
+from app.models.chat import TelegramChat
+from app.models.forwarding_rule import ForwardingRule
 from app.schemas.telegram_account import (
     TelegramAccountCreateRequest,
     TelegramAccountListResponse,
@@ -33,6 +38,7 @@ router = APIRouter(
     tags=["Telegram Accounts"],
     dependencies=[Depends(get_current_superuser)],
 )
+logger = logging.getLogger(__name__)
 
 
 def _account_status(status_value: TelegramAccountStatus) -> TelegramAccountStatusSchema:
@@ -106,6 +112,44 @@ async def _save_authenticated_session(
         encrypt_value(session_string),
     )
     await service.update_status(account_id, TelegramAccountStatus.CONNECTED)
+
+
+async def _register_account_listener(
+    request: Request,
+    session,
+    account: TelegramAccount,
+) -> None:
+    """Subscribe the newly authorized account to its enabled rule sources."""
+    updates = getattr(request.app.state, "telegram_updates_service", None)
+    manager = getattr(request.app.state, "telegram_client_manager", None)
+    if updates is None or manager is None:
+        return
+    credentials = await _api_credentials(session)
+    chat_ids = list((await session.scalars(
+        select(TelegramChat.telegram_chat_id)
+        .join(ForwardingRule, ForwardingRule.source_chat_id == TelegramChat.id)
+        .where(
+            ForwardingRule.telegram_account_id == account.id,
+            ForwardingRule.is_enabled.is_(True),
+            TelegramChat.is_accessible.is_(True),
+        )
+        .distinct()
+    )).all())
+    if not chat_ids:
+        return
+    try:
+        await updates.register_handlers(
+            account.id,
+            credentials.api_id,
+            credentials.api_hash,
+            request.app.state.telegram_update_ingestion.handle_update,
+            chats=chat_ids,
+        )
+    except Exception as exc:
+        logger.warning(
+            "Telegram listener registration failed after authentication",
+            extra={"account_id": account.id, "error_type": type(exc).__name__},
+        )
 
 
 @router.get("/accounts", response_model=TelegramAccountListResponse)
@@ -199,6 +243,8 @@ async def submit_telegram_code(
     account = await service.get_account(payload.account_id)
     if account is None:
         raise HTTPException(status_code=404, detail="Telegram account was not found.")
+    if not account.is_enabled:
+        raise HTTPException(status_code=409, detail="Telegram account is disabled.")
     auth = getattr(request.app.state, "telegram_auth_service", None)
     if auth is None:
         raise HTTPException(status_code=503, detail="Telegram authentication is unavailable.")
@@ -224,6 +270,7 @@ async def submit_telegram_code(
         raise HTTPException(status_code=400, detail="Telegram verification code was rejected.") from exc
     await _save_authenticated_session(request, session, account.id, result)
     await session.commit()
+    await _register_account_listener(request, session, account)
     return TelegramSessionChallengeResponse(
         account_id=account.id,
         challenge_type=TelegramChallengeTypeSchema.PHONE_CODE,
@@ -243,6 +290,8 @@ async def submit_telegram_password(
     account = await service.get_account(payload.account_id)
     if account is None:
         raise HTTPException(status_code=404, detail="Telegram account was not found.")
+    if not account.is_enabled:
+        raise HTTPException(status_code=409, detail="Telegram account is disabled.")
     auth = getattr(request.app.state, "telegram_auth_service", None)
     if auth is None:
         raise HTTPException(status_code=503, detail="Telegram authentication is unavailable.")
@@ -258,6 +307,7 @@ async def submit_telegram_password(
         raise HTTPException(status_code=400, detail="Telegram two-factor authentication failed.") from exc
     await _save_authenticated_session(request, session, account.id, result)
     await session.commit()
+    await _register_account_listener(request, session, account)
     return TelegramSessionOperationResponse(
         account_id=account.id,
         success=True,
