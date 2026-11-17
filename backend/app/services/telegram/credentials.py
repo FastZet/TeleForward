@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from sqlalchemy import select
+
 from app.core.security import decrypt_value, encrypt_value
 from app.models.application_setting import ApplicationSetting
 from app.services.base import BaseService
@@ -49,6 +50,25 @@ class TelegramCredentialsService(BaseService):
             api_id=api_id,
             api_hash=decrypt_value(encrypted_hash),
         )
+
+    async def configuration_status(self) -> tuple[bool, bool]:
+        """Return safe configured flags without decrypting the API hash."""
+        api_id_setting = await self._get_setting(_API_ID_KEY)
+        api_hash_setting = await self._get_setting(_API_HASH_KEY)
+        api_id_configured = bool(
+            api_id_setting is not None
+            and api_id_setting.is_enabled
+            and isinstance(api_id_setting.value, int)
+            and not isinstance(api_id_setting.value, bool)
+            and api_id_setting.value > 0
+        )
+        api_hash_configured = bool(
+            api_hash_setting is not None
+            and api_hash_setting.is_enabled
+            and isinstance(api_hash_setting.value, str)
+            and api_hash_setting.value
+        )
+        return api_id_configured, api_hash_configured
 
     async def set_credentials(self, api_id: int, api_hash: str) -> None:
         """Store valid credentials, encrypting the API hash at rest."""
