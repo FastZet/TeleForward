@@ -28,6 +28,8 @@ from app.services.telegram.client import TelegramClientManager
 from app.services.telegram.copy import TelegramCopyService
 from app.services.telegram.credentials import TelegramCredentialsService
 from app.services.telegram.forwarding import TelegramForwardingService
+from app.services.telegram.edit import TelegramEditService
+from app.services.telegram.delete import TelegramDeleteService
 
 
 class ForwardingJobError(RuntimeError):
@@ -60,6 +62,8 @@ class ProcessingQueueHandlers:
             client_manager,
             album_storage_dir,
         )
+        self._editor = TelegramEditService(client_manager)
+        self._deleter = TelegramDeleteService(client_manager)
 
     async def forward_message(self, job: QueueJobEnvelope) -> None:
         """Evaluate a queued message against its rule and deliver it."""
@@ -222,6 +226,108 @@ class ProcessingQueueHandlers:
                 destination_chat.id,
                 destination_ids,
             )
+
+    async def sync_message_edit(self, job: QueueJobEnvelope) -> None:
+        """Apply an edited source text/caption to its sent destination copy."""
+        rule, message, destination, account, delivery, credentials = (
+            await self._load_sync_context(job)
+        )
+        if message.processing_status.value == "deleted":
+            return
+        if rule.settings.get("sync_edits") is not True:
+            return
+        if delivery.delivery_status != DeliveryStatus.SENT:
+            return
+        if delivery.destination_message_id is None:
+            raise ForwardingJobError("Sent delivery has no destination message ID")
+        content = message.text if message.message_type.value == "text" else message.caption
+        text = content or ""
+        if message.message_type.value == "text":
+            await self._editor.edit_message(
+                account.id,
+                credentials.api_id,
+                credentials.api_hash,
+                destination.telegram_chat_id,
+                delivery.destination_message_id,
+                text,
+                preserve_formatting=False,
+            )
+        else:
+            await self._editor.edit_caption(
+                account.id,
+                credentials.api_id,
+                credentials.api_hash,
+                destination.telegram_chat_id,
+                delivery.destination_message_id,
+                text,
+                preserve_formatting=False,
+            )
+        async with self._session_factory() as session:
+            current = await session.get(ForwardedMessage, delivery.id)
+            if current is not None:
+                current.source_edit_at_delivery = message.edited_at or datetime.now(UTC)
+                current.last_error = None
+                await session.commit()
+
+    async def sync_message_delete(self, job: QueueJobEnvelope) -> None:
+        """Delete the destination copy when its source was deleted."""
+        rule, _message, destination, account, delivery, credentials = (
+            await self._load_sync_context(job)
+        )
+        if rule.settings.get("sync_deletes") is not True:
+            return
+        if delivery.delivery_status != DeliveryStatus.SENT:
+            return
+        if delivery.destination_message_id is None:
+            raise ForwardingJobError("Sent delivery has no destination message ID")
+        result = await self._deleter.delete_message(
+            account.id,
+            credentials.api_id,
+            credentials.api_hash,
+            destination.telegram_chat_id,
+            delivery.destination_message_id,
+            revoke=True,
+        )
+        if not result.successful:
+            raise ForwardingJobError("Telegram could not delete a forwarded message")
+        async with self._session_factory() as session:
+            current = await session.get(ForwardedMessage, delivery.id)
+            if current is not None:
+                current.delivery_status = DeliveryStatus.CANCELLED
+                current.last_error = None
+                await session.commit()
+
+    async def _load_sync_context(self, job: QueueJobEnvelope):
+        if job.job_type not in {QueueJobType.SYNC_EDIT, QueueJobType.SYNC_DELETE}:
+            raise TypeError("job must be a SYNC_EDIT or SYNC_DELETE queue job")
+        if job.forwarding_rule_id is None or job.message_id is None:
+            raise ForwardingJobError("Synchronization job identifiers are missing")
+        async with self._session_factory() as session:
+            rule = await session.get(ForwardingRule, job.forwarding_rule_id)
+            message = await session.get(Message, job.message_id)
+            if rule is None or message is None:
+                raise ForwardingJobError("Rule or source message was not found")
+            destination = await session.get(TelegramChat, rule.destination_chat_id)
+            account = await session.get(TelegramAccount, rule.telegram_account_id)
+            delivery = await session.scalar(
+                select(ForwardedMessage).where(
+                    ForwardedMessage.forwarding_rule_id == rule.id,
+                    ForwardedMessage.source_message_id == message.id,
+                )
+            )
+            if destination is None or account is None or delivery is None:
+                raise ForwardingJobError("Destination delivery context is incomplete")
+            if not account.is_enabled or not destination.is_accessible:
+                raise ForwardingJobError("Telegram account or destination is unavailable")
+            if (
+                message.telegram_account_id != rule.telegram_account_id
+                or destination.telegram_account_id != rule.telegram_account_id
+            ):
+                raise ForwardingJobError("Synchronization ownership does not match")
+            credentials = await TelegramCredentialsService(session).get_credentials()
+            if credentials is None:
+                raise ForwardingJobError("Telegram API credentials are not configured")
+            return rule, message, destination, account, delivery, credentials
 
     async def _deliver(
         self,
@@ -463,6 +569,8 @@ class ProcessingQueueHandlers:
             "drop_media_captions",
             "formatting_entities",
             "transformations",
+            "sync_edits",
+            "sync_deletes",
         }
         unsupported = set(settings) - supported
         if unsupported:
@@ -474,6 +582,8 @@ class ProcessingQueueHandlers:
             "drop_author": False,
             "drop_media_captions": False,
             "formatting_entities": True,
+            "sync_edits": False,
+            "sync_deletes": False,
         }
         for name, default in tuple(defaults.items()):
             value = settings.get(name, default)
