@@ -22,15 +22,15 @@ from app.services.telegram.updates import TelegramUpdate
 _MEDIA_TYPES = {
     "photo": MessageType.PHOTO,
     "video": MessageType.VIDEO,
-    "document": MessageType.DOCUMENT,
-    "audio": MessageType.AUDIO,
     "voice": MessageType.VOICE,
     "video_note": MessageType.VIDEO_NOTE,
     "animation": MessageType.ANIMATION,
     "sticker": MessageType.STICKER,
+    "audio": MessageType.AUDIO,
     "poll": MessageType.POLL,
     "contact": MessageType.CONTACT,
     "location": MessageType.LOCATION,
+    "document": MessageType.DOCUMENT,
 }
 
 
@@ -123,7 +123,7 @@ class TelegramUpdateIngestionService:
 
         media_metadata = {"media_type": media_type} if media_type else None
         digest = hashlib.sha256(
-            f"{message_type.value}\\0{text or ''}\\0{media_type or ''}".encode("utf-8")
+            f"{message_type.value}\0{text or ''}\0{media_type or ''}".encode("utf-8")
         ).hexdigest()
         values: dict[str, Any] = {
             "telegram_account_id": update.account_id,
@@ -183,3 +183,4 @@ class TelegramUpdateIngestionService:
             if name in kind:
                 return name
         return "other"
+
