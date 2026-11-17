@@ -221,6 +221,7 @@ async def _start_background_processing(
     app.state.telegram_client_manager = client_manager
     app.state.telegram_updates_service = updates
     app.state.telegram_auth_service = TelegramAuthenticationService(client_manager)
+    app.state.telegram_update_ingestion = ingestion
     app.state.processing_queue_worker = worker
     app.state.processing_queue_task = asyncio.create_task(
         worker.run(),
@@ -306,6 +307,7 @@ async def _start_background_processing(
         app.state.processing_queue_worker = None
         app.state.telegram_updates_service = None
         app.state.telegram_auth_service = None
+        app.state.telegram_update_ingestion = None
         app.state.telegram_client_manager = None
         raise
 
@@ -369,6 +371,7 @@ async def _stop_background_processing(app: FastAPI) -> None:
         app.state.processing_queue_worker = None
         app.state.telegram_updates_service = None
         app.state.telegram_auth_service = None
+        app.state.telegram_update_ingestion = None
         app.state.telegram_client_manager = None
 
 
