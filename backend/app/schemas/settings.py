@@ -120,6 +120,21 @@ class TelegramSettingsUpdateRequest(RequestSchema):
     auto_reconnect: bool | None = None
 
 
+class TelegramCredentialsUpdateRequest(RequestSchema):
+    """Set the Telegram API credentials used by all connected accounts."""
+
+    api_id: int = Field(gt=0)
+
+    api_hash: SecretStr = Field(min_length=1)
+
+
+class TelegramCredentialsStatusResponse(ResponseSchema):
+    """Report whether both Telegram API credentials are configured."""
+
+    api_id_configured: bool = False
+    api_hash_configured: bool = False
+
+
 class ForwardingSettingsResponse(ResponseSchema):
     """Default forwarding behaviour configuration."""
 
@@ -309,3 +324,4 @@ class ApplicationSettingsResponse(ResponseSchema):
     security: SecuritySettingsResponse
     storage: StorageSettingsResponse
     logging: LoggingSettingsResponse
+
