@@ -13,7 +13,12 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.models.chat import TelegramChat
 from app.models.forwarding_rule import ForwardingRule
-from app.models.message import Message, MessageProcessingStatus, MessageType
+from app.models.message import (
+    Message,
+    MessageProcessingStatus,
+    MessageType,
+)
+from app.models.forwarded_message import DeliveryStatus, ForwardedMessage
 from app.models.processing_queue import QueueJobType
 from app.services.processing_queue import ProcessingQueueService
 from app.services.telegram.updates import TelegramUpdate
@@ -54,21 +59,27 @@ class TelegramUpdateIngestionService:
         deliberately ignored here. Each album member arrives as a new-message
         update; its grouped ID is persisted for album-aware queue handling.
         """
-        if update.update_type != "new_message" or update.message is None:
+        if update.update_type == "message_deleted":
+            return await self._handle_delete(update)
+        if update.update_type not in {"new_message", "message_edited"}:
+            return 0
+        if update.message is None:
             return 0
         if update.chat_id is None or update.message_id is None:
             return 0
 
         async with self._session_factory() as session:
             async with session.begin():
-                chat = await session.scalar(
-                    select(TelegramChat).where(
-                        TelegramChat.telegram_account_id == update.account_id,
-                        TelegramChat.telegram_chat_id == update.chat_id,
+                chat_query = select(TelegramChat).where(
+                    TelegramChat.telegram_account_id == update.account_id,
+                    TelegramChat.telegram_chat_id == update.chat_id,
+                )
+                if update.update_type == "new_message":
+                    chat_query = chat_query.where(
                         TelegramChat.is_accessible.is_(True),
                         TelegramChat.is_archived.is_(False),
                     )
-                )
+                chat = await session.scalar(chat_query)
                 if chat is None:
                     return 0
 
@@ -83,18 +94,102 @@ class TelegramUpdateIngestionService:
                     )
                 ).all()
 
+                if update.update_type == "message_edited":
+                    rules = [
+                        rule for rule in rules
+                        if isinstance(rule.settings, dict)
+                        and rule.settings.get("sync_edits") is True
+                    ]
+
                 queue = ProcessingQueueService(session)
                 enqueued = 0
                 for rule in rules:
+                    key = (
+                        f"sync-edit:{rule.id}:{message_id}:"
+                        f"{(await session.get(Message, message_id)).content_hash}"
+                        if update.update_type == "message_edited"
+                        else f"forward:{rule.id}:{message_id}"
+                    )
                     _job, inserted = await queue.enqueue(
-                        QueueJobType.FORWARD_MESSAGE,
+                        (
+                            QueueJobType.SYNC_EDIT
+                            if update.update_type == "message_edited"
+                            else QueueJobType.FORWARD_MESSAGE
+                        ),
                         {"source_telegram_message_id": update.message_id},
-                        deduplication_key=f"forward:{rule.id}:{message_id}",
+                        deduplication_key=key,
                         forwarding_rule_id=rule.id,
                         message_id=message_id,
                     )
                     enqueued += int(inserted)
                 return enqueued
+
+    async def _handle_delete(self, update: TelegramUpdate) -> int:
+        if update.chat_id is None or not update.message_ids:
+            return 0
+        async with self._session_factory() as session:
+            async with session.begin():
+                chat = await session.scalar(
+                    select(TelegramChat).where(
+                        TelegramChat.telegram_account_id == update.account_id,
+                        TelegramChat.telegram_chat_id == update.chat_id,
+                    )
+                )
+                if chat is None:
+                    return 0
+                messages = list((await session.scalars(
+                    select(Message).where(
+                        Message.telegram_account_id == update.account_id,
+                        Message.source_chat_id == chat.id,
+                        Message.telegram_message_id.in_(update.message_ids),
+                    )
+                )).all())
+                if not messages:
+                    return 0
+                ids = [message.id for message in messages]
+                for message in messages:
+                    message.processing_status = MessageProcessingStatus.DELETED
+
+                rules = list((await session.scalars(
+                    select(ForwardingRule).where(
+                        ForwardingRule.telegram_account_id == update.account_id,
+                        ForwardingRule.source_chat_id == chat.id,
+                        ForwardingRule.is_enabled.is_(True),
+                    )
+                )).all())
+                enabled_rules = [
+                    rule for rule in rules
+                    if isinstance(rule.settings, dict)
+                    and rule.settings.get("sync_deletes") is True
+                ]
+                if not enabled_rules:
+                    return 0
+                sent_pairs = list((await session.execute(
+                    select(ForwardedMessage.forwarding_rule_id,
+                           ForwardedMessage.source_message_id)
+                    .where(
+                        ForwardedMessage.forwarding_rule_id.in_(
+                            [rule.id for rule in enabled_rules]
+                        ),
+                        ForwardedMessage.source_message_id.in_(ids),
+                        ForwardedMessage.delivery_status == DeliveryStatus.SENT,
+                    )
+                )).all())
+                pair_set = set(sent_pairs)
+                queue = ProcessingQueueService(session)
+                inserted_count = 0
+                for rule_id, message_id in pair_set:
+                    _job, inserted = await queue.enqueue(
+                        QueueJobType.SYNC_DELETE,
+                        {"source_telegram_message_id": next(
+                            m.telegram_message_id for m in messages if m.id == message_id
+                        )},
+                        deduplication_key=f"sync-delete:{rule_id}:{message_id}",
+                        forwarding_rule_id=rule_id,
+                        message_id=message_id,
+                    )
+                    inserted_count += int(inserted)
+                return inserted_count
 
     async def _upsert_message(
         self,
@@ -136,6 +231,7 @@ class TelegramUpdateIngestionService:
             "caption": text if message_type != MessageType.TEXT else None,
             "media_metadata": media_metadata,
             "telegram_date": date,
+            "edited_at": getattr(source, "edit_date", None),
             "processing_status": MessageProcessingStatus.PENDING,
             "content_hash": digest,
         }
@@ -146,12 +242,23 @@ class TelegramUpdateIngestionService:
             statement = pg_insert(Message).values(**values)
         else:
             raise RuntimeError(f"Message ingestion does not support {dialect!r}")
-        statement = statement.on_conflict_do_nothing(
+        statement = statement.on_conflict_do_update(
             index_elements=[
                 Message.telegram_account_id,
                 Message.source_chat_id,
                 Message.telegram_message_id,
-            ]
+            ],
+            set_={
+                key: value
+                for key, value in values.items()
+                if key not in {
+                    "telegram_account_id",
+                    "source_chat_id",
+                    "telegram_message_id",
+                    "processing_status",
+                }
+                and (key != "edited_at" or update.update_type == "message_edited")
+            },
         ).returning(Message.id)
         inserted_id = (await session.execute(statement)).scalar_one_or_none()
         if inserted_id is not None:
