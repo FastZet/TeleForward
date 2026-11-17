@@ -18,6 +18,9 @@ from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
 
 from app import __app_name__, __version__
+from app.api.authentication import router as authentication_router
+from app.api.telegram_credentials import router as telegram_credentials_router
+from app.api.telegram_accounts import router as telegram_accounts_router
 from app.core.config import get_settings
 from app.core.csrf import (
     CSRFMiddleware,
@@ -100,6 +103,9 @@ def create_application(
     application.state.ready = False
     application.state.settings = settings
     application.state.limiter = limiter
+    application.include_router(authentication_router)
+    application.include_router(telegram_credentials_router)
+    application.include_router(telegram_accounts_router)
 
     # Exception handlers.
     register_exception_handlers(application)
@@ -223,3 +229,4 @@ def create_application(
     )
 
     return application
+

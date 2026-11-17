@@ -119,7 +119,16 @@ def _get_configured_secret(
             "Complete the TeleForward security setup first."
         )
 
-    secret_value = configured_secret.get_secret_value()
+    if isinstance(configured_secret, SecretStr):
+        secret_value = configured_secret.get_secret_value()
+    elif isinstance(configured_secret, str):
+        # Lifecycle bootstrap replaces unset SecretStr fields with
+        # their persisted plain-string values after startup.
+        secret_value = configured_secret
+    else:
+        raise RuntimeError(
+            f"{secret_name} must be configured as a string secret."
+        )
 
     if len(secret_value) < minimum_length:
         raise RuntimeError(
@@ -319,3 +328,4 @@ def decode_access_token(token: str) -> dict[str, Any]:
         raise ValueError(
             "Invalid or expired access token."
         ) from exc
+

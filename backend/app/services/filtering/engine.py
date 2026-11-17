@@ -85,6 +85,8 @@ class FilterContext:
 
     media_type: str | None = None
     has_media: bool = False
+    has_text: bool = False
+    has_link: bool = False
     has_photo: bool = False
     has_video: bool = False
     has_document: bool = False
@@ -507,3 +509,4 @@ class FilterEngine:
         compiled = re.compile(expected, flags)
 
         return compiled.search(actual) is not None
+

@@ -65,6 +65,7 @@ class TelegramCopyService:
         *,
         silent: bool = False,
         formatting_entities: bool = True,
+        text_override: str | None = None,
     ) -> TelegramCopyResult:
         """Copy a single Telegram message."""
         results = await self.copy_messages(
@@ -76,6 +77,11 @@ class TelegramCopyService:
             message_ids=[message_id],
             silent=silent,
             formatting_entities=formatting_entities,
+            text_overrides=(
+                {message_id: text_override}
+                if text_override is not None
+                else None
+            ),
         )
 
         return results[0]
@@ -91,6 +97,7 @@ class TelegramCopyService:
         *,
         silent: bool = False,
         formatting_entities: bool = True,
+        text_overrides: dict[int, str] | None = None,
     ) -> list[TelegramCopyResult]:
         """
         Copy messages by re-sending their content.
@@ -107,6 +114,18 @@ class TelegramCopyService:
             destination_chat_id,
         )
         self._validate_message_ids(message_ids)
+        if text_overrides is not None:
+            if not isinstance(text_overrides, dict):
+                raise TypeError("text_overrides must be a dictionary or None.")
+            if any(
+                isinstance(message_id, bool)
+                or not isinstance(message_id, int)
+                or message_id not in message_ids
+                or not isinstance(text, str)
+                or len(text) > 4096
+                for message_id, text in text_overrides.items()
+            ):
+                raise ValueError("text_overrides contains an invalid message or text value.")
 
         client = await self._get_authorized_client(
             account_id,
@@ -183,6 +202,11 @@ class TelegramCopyService:
                         message=message,
                         silent=silent,
                         formatting_entities=formatting_entities,
+                        text=(
+                            text_overrides.get(message_id, message.message or "")
+                            if text_overrides is not None
+                            else message.message or ""
+                        ),
                     )
 
                 except FloodWaitError:
@@ -250,10 +274,9 @@ class TelegramCopyService:
         *,
         silent: bool,
         formatting_entities: bool,
+        text: str,
     ) -> Message | None:
         """Copy an individual text or media message."""
-        text = message.message or ""
-
         entities = (
             message.entities
             if formatting_entities
@@ -355,3 +378,4 @@ class TelegramCopyService:
 
         if len(set(message_ids)) != len(message_ids):
             raise ValueError("Duplicate message IDs are not allowed.")
+

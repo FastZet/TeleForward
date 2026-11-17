@@ -290,17 +290,11 @@ class TelegramAuthenticationService:
 
         async with self._lock:
             self._pending.pop(account_id, None)
-
-            client = await self.client_manager.get_client(
-                account_id=account_id,
-                api_id=1,
-                api_hash="logout-placeholder",
-                connect=False,
-            )
-
-            if client.is_connected():
+            client = self.client_manager.get_managed_client(account_id)
+            if client is not None:
                 try:
-                    await client.log_out()
+                    if client.is_connected():
+                        await client.log_out()
                 finally:
                     await self.client_manager.disconnect(account_id)
 
@@ -335,3 +329,4 @@ class TelegramAuthenticationService:
             username=getattr(user, "username", None),
             phone_number=getattr(user, "phone", None),
         )
+

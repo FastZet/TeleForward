@@ -163,4 +163,5 @@ class TelegramSessionService:
         if account_id <= 0:
             raise ValueError("account_id must be positive.")
 
-        return self.client_manager._clients.get(account_id)
+        return self.client_manager.get_managed_client(account_id)
+

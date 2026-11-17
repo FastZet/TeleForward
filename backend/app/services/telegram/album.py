@@ -10,6 +10,7 @@ Temporary files are automatically removed after the operation.
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -89,6 +90,7 @@ class TelegramAlbumService:
         *,
         silent: bool = False,
         formatting_entities: bool = True,
+        caption_overrides: Mapping[int, str] | None = None,
     ) -> TelegramAlbumCopyResult:
         """
         Copy a grouped media album.
@@ -121,6 +123,18 @@ class TelegramAlbumService:
         )
 
         requested_ids = list(message_ids)
+        if caption_overrides is not None:
+            if not isinstance(caption_overrides, Mapping):
+                raise TypeError("caption_overrides must be a mapping or None.")
+            if any(
+                isinstance(message_id, bool)
+                or not isinstance(message_id, int)
+                or message_id not in requested_ids
+                or not isinstance(caption, str)
+                or len(caption) > 4096
+                for message_id, caption in caption_overrides.items()
+            ):
+                raise ValueError("caption_overrides contains an invalid message or caption.")
 
         messages = await client.get_messages(
             source,
@@ -197,7 +211,12 @@ class TelegramAlbumService:
                 )
 
                 captions = [
-                    message.message or None
+                    (
+                        caption_overrides[message.id] or None
+                        if caption_overrides is not None
+                        and message.id in caption_overrides
+                        else message.message or None
+                    )
                     for message in ordered_messages
                 ]
 
@@ -434,3 +453,4 @@ class TelegramAlbumService:
 
         if len(set(message_ids)) != len(message_ids):
             raise ValueError("Duplicate message IDs are not allowed.")
+
