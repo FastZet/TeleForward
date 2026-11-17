@@ -55,9 +55,10 @@ class TelegramUpdateIngestionService:
     async def handle_update(self, update: TelegramUpdate) -> int:
         """Persist one supported update; return how many jobs were enqueued.
 
-        Edits and deletions need dedicated synchronization semantics and are
-        deliberately ignored here. Each album member arrives as a new-message
-        update; its grouped ID is persisted for album-aware queue handling.
+        Edits and deletions are queued only for rules that explicitly enable
+        their respective synchronization setting. Each album member arrives
+        as a new-message update; its grouped ID is persisted for album-aware
+        queue handling.
         """
         if update.update_type == "message_deleted":
             return await self._handle_delete(update)
@@ -100,16 +101,45 @@ class TelegramUpdateIngestionService:
                         if isinstance(rule.settings, dict)
                         and rule.settings.get("sync_edits") is True
                     ]
+                    if rules:
+                        delivered_rule_ids = set(
+                            (
+                                await session.scalars(
+                                    select(ForwardedMessage.forwarding_rule_id).where(
+                                        ForwardedMessage.forwarding_rule_id.in_(
+                                            [rule.id for rule in rules]
+                                        ),
+                                        ForwardedMessage.source_message_id == message_id,
+                                        ForwardedMessage.delivery_status == DeliveryStatus.SENT,
+                                    )
+                                )
+                            ).all()
+                        )
+                    else:
+                        delivered_rule_ids = set()
+                    rules = [rule for rule in rules if rule.id in delivered_rule_ids]
+
+                elif update.update_type == "new_message":
+                    message_row = await session.get(Message, message_id)
+                    if (
+                        message_row is None
+                        or message_row.processing_status == MessageProcessingStatus.DELETED
+                    ):
+                        return 0
 
                 queue = ProcessingQueueService(session)
                 enqueued = 0
                 for rule in rules:
-                    key = (
-                        f"sync-edit:{rule.id}:{message_id}:"
-                        f"{(await session.get(Message, message_id)).content_hash}"
-                        if update.update_type == "message_edited"
-                        else f"forward:{rule.id}:{message_id}"
-                    )
+                    if update.update_type == "message_edited":
+                        message_row = await session.get(Message, message_id)
+                        if message_row is None:
+                            continue
+                        key = (
+                            f"sync-edit:{rule.id}:{message_id}:"
+                            f"{message_row.content_hash}"
+                        )
+                    else:
+                        key = f"forward:{rule.id}:{message_id}"
                     _job, inserted = await queue.enqueue(
                         (
                             QueueJobType.SYNC_EDIT
