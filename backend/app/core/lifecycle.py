@@ -35,6 +35,7 @@ from app.core.paths import (
     initialise_storage,
     validate_storage,
 )
+from app.core.security import decrypt_value, encrypt_value
 from app.database.engine import get_database_engine
 from app.database.init import (
     initialise_database,
@@ -49,6 +50,7 @@ from app.services.processing_queue_handlers import ProcessingQueueHandlers
 from app.services.processing_queue_worker import ProcessingQueueWorker
 from app.services.telegram.client import TelegramClientManager
 from app.services.telegram.credentials import TelegramCredentialsService
+from app.services.telegram.auth import TelegramAuthenticationService
 from app.services.telegram.ingestion import TelegramUpdateIngestionService
 from app.services.telegram.updates import TelegramUpdatesService
 
@@ -218,6 +220,7 @@ async def _start_background_processing(
 
     app.state.telegram_client_manager = client_manager
     app.state.telegram_updates_service = updates
+    app.state.telegram_auth_service = TelegramAuthenticationService(client_manager)
     app.state.processing_queue_worker = worker
     app.state.processing_queue_task = asyncio.create_task(
         worker.run(),
@@ -237,6 +240,26 @@ async def _start_background_processing(
                 )
             ).all()
             for account in accounts:
+                if account.session_data_encrypted:
+                    try:
+                        await client_manager.get_client(
+                            account.id,
+                            credentials.api_id,
+                            credentials.api_hash,
+                            connect=False,
+                            session_string=decrypt_value(
+                                account.session_data_encrypted
+                            ),
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "Stored Telegram session could not be restored",
+                            extra={
+                                "account_id": account.id,
+                                "error_type": type(exc).__name__,
+                            },
+                        )
+                        continue
                 chat_ids = list(
                     (
                         await session.scalars(
@@ -282,6 +305,7 @@ async def _start_background_processing(
         app.state.processing_queue_task = None
         app.state.processing_queue_worker = None
         app.state.telegram_updates_service = None
+        app.state.telegram_auth_service = None
         app.state.telegram_client_manager = None
         raise
 
@@ -300,11 +324,40 @@ async def _stop_background_processing(app: FastAPI) -> None:
     if task is not None:
         await task
     if client_manager is not None:
+        session_factory = getattr(app.state, "database_session_factory", None)
+        if session_factory is not None:
+            async with session_factory() as session:
+                account_ids = client_manager.get_managed_account_ids()
+                accounts = list((await session.scalars(
+                    select(TelegramAccount).where(
+                        TelegramAccount.id.in_(account_ids)
+                    )
+                )).all()) if account_ids else []
+                for account in accounts:
+                    client = client_manager.get_managed_client(account.id)
+                    if client is None or not client.is_connected():
+                        continue
+                    try:
+                        if not await client.is_user_authorized():
+                            continue
+                        session_string = await client_manager.export_session(account.id)
+                        if session_string:
+                            account.session_data_encrypted = encrypt_value(session_string)
+                    except Exception as exc:
+                        logger.warning(
+                            "Telegram session persistence failed during shutdown",
+                            extra={
+                                "account_id": account.id,
+                                "error_type": type(exc).__name__,
+                            },
+                        )
+                await session.commit()
         await client_manager.disconnect_all()
 
     app.state.processing_queue_task = None
     app.state.processing_queue_worker = None
     app.state.telegram_updates_service = None
+    app.state.telegram_auth_service = None
     app.state.telegram_client_manager = None
 
 
