@@ -61,6 +61,14 @@ class HistoryTrackingScheduledTask(BaseScheduledTask):
                 raise TypeError(
                     "Scheduled task must return ScheduledTaskResult"
                 )
+            if (
+                result.job_id != context.job_id
+                or result.execution_id != context.execution_id
+                or result.task_name != self.name
+            ):
+                raise ValueError(
+                    "Task result identifiers do not match execution context"
+                )
         except Exception as exc:
             result = self.failed_result(
                 context,
