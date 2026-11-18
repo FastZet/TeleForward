@@ -85,7 +85,7 @@ class SQLiteDatabaseBackup:
             source_connection = None
 
             os.chmod(temporary, 0o600)
-            with temporary.open("rb") as backup_file:
+            with temporary.open("r+b") as backup_file:
                 os.fsync(backup_file.fileno())
             os.replace(temporary, destination)
 
