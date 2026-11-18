@@ -17,6 +17,7 @@ from sqlalchemy.ext.asyncio import async_engine_from_config
 from app.core.config import get_settings
 from app.database.base import Base
 import app.models  # noqa: F401 - registers all ORM models
+import app.services.scheduling.history  # noqa: F401 - registers execution-history model
 
 
 # Alembic Config object.
