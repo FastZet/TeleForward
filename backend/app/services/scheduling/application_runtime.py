@@ -11,7 +11,6 @@ from app.core.config import get_settings
 from app.services.scheduling.cleanup import SchedulingCleanupService
 from app.services.scheduling.history import ExecutionHistoryRepository
 from app.services.scheduling.manager import SchedulingManager
-from app.services.scheduling.persistence import SQLAlchemyJobRepository
 from app.services.scheduling.scheduler import SchedulerService
 from app.services.scheduling.scheduler_runtime import SchedulerRuntime
 from app.services.scheduling.scheduler_runtime_integration import (
