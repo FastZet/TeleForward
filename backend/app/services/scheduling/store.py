@@ -316,6 +316,12 @@ class SQLAlchemyJobStore(BaseJobStore):
                 "Persisted job metadata must be a mapping"
             )
 
+        if (
+            _STORE_METADATA_KEY not in stored
+            and "values" not in stored
+        ):
+            return copy.deepcopy(dict(stored)), {}
+
         envelope = stored.get(_STORE_METADATA_KEY, {})
         values = stored.get("values", {})
 
@@ -364,6 +370,8 @@ class SQLAlchemyJobStore(BaseJobStore):
             trigger_config=trigger_config,
             enabled=definition.enabled,
             job_metadata=cls._encode_metadata(definition),
+            created_at=definition.created_at,
+            updated_at=definition.updated_at,
         )
 
     @classmethod
@@ -381,6 +389,8 @@ class SQLAlchemyJobStore(BaseJobStore):
         record.trigger_config = replacement.trigger_config
         record.enabled = replacement.enabled
         record.job_metadata = replacement.job_metadata
+        record.created_at = replacement.created_at
+        record.updated_at = replacement.updated_at
 
     @classmethod
     def _to_definition(
@@ -389,20 +399,38 @@ class SQLAlchemyJobStore(BaseJobStore):
     ) -> ScheduledJobDefinition:
         """Convert a database record into a domain definition."""
 
-        from datetime import datetime
+        from datetime import datetime, timezone
 
         metadata, timestamps = cls._decode_metadata(
             record.job_metadata
         )
 
         try:
-            created_at = datetime.fromisoformat(
-                timestamps["created_at"]
-            ) if "created_at" in timestamps else None
+            created_at = record.created_at or (
+                datetime.fromisoformat(timestamps["created_at"])
+                if "created_at" in timestamps
+                else None
+            )
 
-            updated_at = datetime.fromisoformat(
-                timestamps["updated_at"]
-            ) if "updated_at" in timestamps else None
+            updated_at = record.updated_at or (
+                datetime.fromisoformat(timestamps["updated_at"])
+                if "updated_at" in timestamps
+                else None
+            )
+
+            if created_at is not None:
+                created_at = (
+                    created_at.replace(tzinfo=timezone.utc)
+                    if created_at.tzinfo is None
+                    else created_at.astimezone(timezone.utc)
+                )
+
+            if updated_at is not None:
+                updated_at = (
+                    updated_at.replace(tzinfo=timezone.utc)
+                    if updated_at.tzinfo is None
+                    else updated_at.astimezone(timezone.utc)
+                )
 
             return ScheduledJobDefinition(
                 job_id=record.job_id,

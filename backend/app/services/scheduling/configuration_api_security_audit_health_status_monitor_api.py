@@ -16,6 +16,7 @@ from fastapi import (
     Request,
     status,
 )
+from fastapi.params import Depends as DependsParameter
 from fastapi.routing import APIRoute
 
 from app.services.scheduling.configuration_api_security_audit_health_status_monitor_integration import (
@@ -66,8 +67,8 @@ def _normalize_prefix(prefix: str) -> str:
 
 
 def _validate_dependencies(
-    dependencies: Sequence[Depends] | None,
-) -> list[Depends]:
+    dependencies: Sequence[DependsParameter] | None,
+) -> list[DependsParameter]:
     if dependencies is None:
         return []
 
@@ -77,7 +78,7 @@ def _validate_dependencies(
     result = list(dependencies)
 
     for dependency in result:
-        if not isinstance(dependency, Depends):
+        if not isinstance(dependency, DependsParameter):
             raise TypeError(
                 "every dependency must be created with fastapi.Depends"
             )

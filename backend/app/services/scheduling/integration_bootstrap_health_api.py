@@ -6,7 +6,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from fastapi import APIRouter, FastAPI, HTTPException, status
+from fastapi import APIRouter, FastAPI, HTTPException, Request, status
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.services.scheduling.integration_bootstrap_health import (
@@ -143,8 +143,6 @@ def get_bootstrap_health_report_from_app_context() -> (
 
 def create_app_bootstrap_health_router() -> APIRouter:
     """Create a router whose endpoint resolves the current app state."""
-    from fastapi import Request
-
     router = APIRouter(tags=["Health"])
 
     @router.get(

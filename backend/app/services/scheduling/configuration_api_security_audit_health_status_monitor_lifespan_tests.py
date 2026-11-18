@@ -11,14 +11,15 @@ import pytest
 from fastapi import FastAPI
 
 from app.services.scheduling.configuration_api_security_audit_health_status_monitor import (
-    install_configuration_api_security_audit_health_status_monitor,
+    SecurityAuditHealthStatusMonitor,
+)
+from app.services.scheduling.configuration_api_security_audit_health_status_monitor_integration import (
+    MONITOR_INSTALLED_STATE_KEY,
+    MONITOR_STATE_KEY,
 )
 from app.services.scheduling.configuration_api_security_audit_health_status_monitor_lifespan import (
     SecurityAuditHealthStatusMonitorLifespanError,
     create_security_audit_health_status_monitor_lifespan,
-)
-from app.services.scheduling.configuration_api_security_audit_health_status_monitor import (
-    SecurityAuditHealthStatusMonitor,
 )
 
 
@@ -35,10 +36,18 @@ def monitor(monkeypatch: pytest.MonkeyPatch) -> SecurityAuditHealthStatusMonitor
 
     state = {"running": False}
 
-    async def start(*, run_immediately: bool = True) -> None:
+    async def start(
+        self,
+        *,
+        run_immediately: bool = True,
+    ) -> None:
         state["running"] = True
 
-    async def stop(*, cancel: bool = True) -> None:
+    async def stop(
+        self,
+        *,
+        cancel_running_check: bool = True,
+    ) -> None:
         state["running"] = False
 
     monkeypatch.setattr(
@@ -65,10 +74,8 @@ def install_monitor(
     app: FastAPI,
     monitor: SecurityAuditHealthStatusMonitor,
 ) -> None:
-    install_configuration_api_security_audit_health_status_monitor(
-        app,
-        monitor,
-    )
+    setattr(app.state, MONITOR_STATE_KEY, monitor)
+    setattr(app.state, MONITOR_INSTALLED_STATE_KEY, True)
 
 
 @pytest.mark.asyncio

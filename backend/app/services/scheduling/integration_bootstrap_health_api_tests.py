@@ -192,7 +192,7 @@ def test_endpoint_maps_health_status_to_http_status(
     monkeypatch.setattr(
         api_module,
         "get_bootstrap_health_report",
-        lambda _app: Mock(),
+        lambda _app: Mock(status=health_status),
     )
     monkeypatch.setattr(
         api_module,
@@ -201,7 +201,6 @@ def test_endpoint_maps_health_status_to_http_status(
     )
 
     response = client.get(BOOTSTRAP_HEALTH_API_PATH)
-
     assert response.status_code == expected_http_status
 
     if expected_http_status == 200:

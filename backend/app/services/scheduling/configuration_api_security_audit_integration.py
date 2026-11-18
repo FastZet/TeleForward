@@ -223,12 +223,15 @@ def record_request_rejection(
     metadata: Mapping[str, Any] | None = None,
 ) -> SecurityAuditEvent:
     """Record a rejected API request."""
+    if not isinstance(reason, str) or not reason.strip():
+        raise ValueError("reason must be a non-empty string")
+
     return record_security_audit_event(
         app,
         SecurityAuditEventType.REQUEST_REJECTED,
         principal_id=principal_id,
         success=False,
-        reason=reason,
+        reason=reason.strip(),
         path=path,
         method=method,
         source_ip=source_ip,

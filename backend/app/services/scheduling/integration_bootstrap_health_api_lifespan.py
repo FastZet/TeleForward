@@ -37,6 +37,8 @@ LifespanCallback = Callable[
     Any | Awaitable[Any],
 ]
 
+LifespanFactory = Callable[[FastAPI], Any]
+
 ExistingLifespan = Callable[
     [FastAPI],
     Any,

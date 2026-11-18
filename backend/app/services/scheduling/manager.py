@@ -55,6 +55,12 @@ class SchedulingManager:
         self._initialised = False
 
     @property
+    def scheduler(self) -> SchedulerService:
+        """Return the scheduler engine used by this manager."""
+
+        return self._scheduler
+
+    @property
     def is_initialised(self) -> bool:
         """Return whether stored jobs have been restored."""
 
@@ -64,6 +70,11 @@ class SchedulingManager:
         """Register a task implementation with the scheduler."""
 
         self._scheduler.register_task(task)
+
+    def unregister_task(self, task_name: str) -> None:
+        """Unregister a task when no active job references it."""
+
+        self._scheduler.unregister_task(task_name)
 
     async def create_job(
         self,
@@ -271,6 +282,7 @@ class SchedulingManager:
         """
 
         failures: list[str] = []
+        self._initialised = False
         definitions = await self._job_store.list_all(
             enabled_only=True,
         )
@@ -278,6 +290,21 @@ class SchedulingManager:
         for definition in definitions:
             try:
                 self._ensure_task_registered(definition.task_name)
+
+                current_job = self._scheduler.get_job(
+                    definition.job_id
+                )
+
+                if current_job is not None:
+                    if (
+                        current_job.func == self._scheduler._execute_task
+                        and current_job.args
+                        and current_job.args[0] == definition.task_name
+                    ):
+                        continue
+
+                    self._scheduler.remove_job(definition.job_id)
+
                 self._schedule_definition(definition)
 
             except Exception:
@@ -298,13 +325,18 @@ class SchedulingManager:
 
         return failures
 
-    def start(self, *, paused: bool = False) -> None:
-        """Start the underlying scheduler."""
+    async def start(self, *, paused: bool = False) -> None:
+        """Restore persisted jobs and start the scheduler."""
 
         if not self._initialised:
-            raise RuntimeError(
-                "Scheduled jobs must be restored before starting"
-            )
+            failures = await self.restore_jobs()
+
+            if failures:
+                failed_jobs = ", ".join(failures)
+                raise RuntimeError(
+                    "Could not restore scheduled jobs before startup: "
+                    + failed_jobs
+                )
 
         self._scheduler.start(paused=paused)
 

@@ -5,7 +5,9 @@ from __future__ import annotations
 import logging
 from typing import Any, Callable, Sequence
 
-from sqlalchemy import Boolean, JSON, String, select
+from datetime import datetime, timezone
+
+from sqlalchemy import Boolean, DateTime, JSON, String, select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import Mapped, mapped_column
@@ -60,6 +62,19 @@ class ScheduledJobRecord(Base):
         default=dict,
     )
 
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+    )
+
 
 class ScheduledJobPersistenceError(RuntimeError):
     """Raised when scheduled-job persistence fails."""
@@ -101,17 +116,19 @@ class SQLAlchemyJobRepository:
                         record = ScheduledJobRecord(
                             job_id=definition.job_id,
                             task_name=definition.task_name,
-                            job_type=definition.job_type.value,
+                            job_type=definition.trigger_type.value,
                             trigger_config=dict(
                                 definition.trigger_config
                             ),
                             enabled=definition.enabled,
                             job_metadata=dict(definition.metadata),
+                            created_at=definition.created_at,
+                            updated_at=definition.updated_at,
                         )
                         session.add(record)
                     else:
                         record.task_name = definition.task_name
-                        record.job_type = definition.job_type.value
+                        record.job_type = definition.trigger_type.value
                         record.trigger_config = dict(
                             definition.trigger_config
                         )
@@ -119,6 +136,8 @@ class SQLAlchemyJobRepository:
                         record.job_metadata = dict(
                             definition.metadata
                         )
+                        record.created_at = definition.created_at
+                        record.updated_at = definition.updated_at
 
             return definition
 
@@ -274,13 +293,28 @@ class SQLAlchemyJobRepository:
         """Convert a database record into a domain definition."""
 
         try:
+            created_at = record.created_at
+            updated_at = record.updated_at
+
+            if created_at.tzinfo is None:
+                created_at = created_at.replace(tzinfo=timezone.utc)
+            else:
+                created_at = created_at.astimezone(timezone.utc)
+
+            if updated_at.tzinfo is None:
+                updated_at = updated_at.replace(tzinfo=timezone.utc)
+            else:
+                updated_at = updated_at.astimezone(timezone.utc)
+
             return ScheduledJobDefinition(
                 job_id=record.job_id,
                 task_name=record.task_name,
-                job_type=ScheduledJobType(record.job_type),
+                trigger_type=ScheduledJobType(record.job_type),
                 trigger_config=dict(record.trigger_config or {}),
                 enabled=record.enabled,
                 metadata=dict(record.job_metadata or {}),
+                created_at=created_at,
+                updated_at=updated_at,
             )
 
         except (TypeError, ValueError, KeyError) as exc:

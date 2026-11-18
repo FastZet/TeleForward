@@ -39,6 +39,9 @@ from app.database.init import (
     shutdown_database,
 )
 from app.database.session import get_session_factory
+from app.services.scheduling.application_runtime import (
+    build_application_scheduler,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -193,6 +196,7 @@ async def application_lifespan(
     app.state.ready = False
 
     database_initialised = False
+    scheduler_runtime = None
 
     try:
         # Load application configuration.
@@ -219,6 +223,10 @@ async def application_lifespan(
         # Expose database resources to application dependencies.
         app.state.database_engine = get_database_engine()
         app.state.database_session_factory = get_session_factory()
+
+        # Restore persisted jobs and start scheduling before readiness.
+        scheduler_runtime = build_application_scheduler(app)
+        await scheduler_runtime.start()
 
         # Notify application event subscribers.
         await _publish_event(
@@ -258,6 +266,16 @@ async def application_lifespan(
             logger.exception(
                 "Failed to publish application shutdown event"
             )
+
+        if scheduler_runtime is not None:
+            try:
+                await scheduler_runtime.shutdown()
+            except Exception:
+                logger.exception(
+                    "Scheduler runtime shutdown encountered an error"
+                )
+
+        app.state.scheduler_runtime = None
 
         if database_initialised:
             try:

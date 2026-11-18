@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from fastapi import Depends, FastAPI, HTTPException, status
 from fastapi.testclient import TestClient
 
@@ -233,7 +235,7 @@ def test_status_endpoint_includes_health_api_component(
     )
 
     assert api_component is not None
-    assert api_component["status"] == "healthy"
+    assert api_component["status"] == "not_installed"
 
 
 def test_status_endpoint_uses_custom_prefix(

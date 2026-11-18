@@ -292,7 +292,7 @@ def test_record_security_audit_event_preserves_metadata(
 
     record_security_audit_event(
         app,
-        SecurityAuditEventType.CONFIGURATION_CHANGED,
+        SecurityAuditEventType.SECURITY_CONFIGURATION_CHANGED,
         metadata={
             "operation": "update",
             "configuration_id": "config-1",

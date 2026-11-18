@@ -380,7 +380,9 @@ async def test_multiple_cleanup_errors_are_preserved(
     components: dict[str, object],
 ) -> None:
     factories = make_factories(components)
-    factories["task_registry"] = lambda: None
+    # Fail after every required component has been constructed so cleanup
+    # failures from both the job store and manager can be observed.
+    factories["scheduler"] = lambda: None
 
     def failing_manager_cleanup(component: object) -> None:
         raise RuntimeError("manager failure")

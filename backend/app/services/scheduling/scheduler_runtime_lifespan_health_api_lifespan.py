@@ -55,7 +55,7 @@ def _ensure_health_api_installed(
             app
         )
 
-        if state["consistent"]:
+        if state["integrated"] and state["consistent"]:
             if service is not None:
                 from app.services.scheduling.scheduler_runtime_lifespan_health_api_integration import (
                     get_scheduler_health_api_integration,

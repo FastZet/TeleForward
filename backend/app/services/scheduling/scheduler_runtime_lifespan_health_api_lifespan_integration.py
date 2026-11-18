@@ -79,6 +79,14 @@ def install_scheduler_health_api_lifespan_integration(
     if not isinstance(replace, bool):
         raise TypeError("replace must be a boolean")
 
+    if service is not None and not isinstance(
+        service,
+        SchedulerRuntimeLifespanHealthService,
+    ):
+        raise TypeError(
+            "service must be a SchedulerRuntimeLifespanHealthService"
+        )
+
     existing_state = _get_integration_state(app)
 
     if existing_state is not None:

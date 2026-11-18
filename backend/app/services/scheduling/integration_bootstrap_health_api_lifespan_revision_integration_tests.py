@@ -17,6 +17,7 @@ from app.services.scheduling.integration_bootstrap_health_api_lifespan_revision 
 )
 
 from app.services.scheduling.integration_bootstrap_health_api_lifespan_revision_integration import (
+    BootstrapHealthLifespanIntegrationError,
     BootstrapHealthLifespanShutdownError,
     LifespanExecutionState,
     LifespanPhase,
@@ -42,7 +43,7 @@ def install_fake_integration(
 
     monkeypatch.setattr(
         integration_module,
-        "SchedulingBootstrapHealthAPIIntegration",
+        "BootstrapHealthAPIIntegration",
         FakeIntegration,
     )
 
@@ -364,7 +365,7 @@ async def test_cleanup_cancellation_is_retained_in_state(
     assert state is not None
     assert state.cleanup_report is not None
     assert state.cleanup_report.cancellation is not None
-    assert state.phase == LifespanPhase.STOPPED
+    assert state.phase == LifespanPhase.CANCELLED
 
 
 @pytest.mark.asyncio
@@ -416,7 +417,7 @@ async def test_primary_cancellation_remains_primary(
 
     assert state is not None
     assert state.primary_error_type == "CancelledError"
-    assert state.phase == LifespanPhase.STOPPED
+    assert state.phase == LifespanPhase.CANCELLED
 
 
 @pytest.mark.asyncio
@@ -462,7 +463,7 @@ async def test_external_cancellation_during_cleanup_updates_final_state(
 
     assert state is not None
     assert state.cleanup_report is not None
-    assert state.phase == LifespanPhase.STOPPED
+    assert state.phase == LifespanPhase.CANCELLED
 
 
 @pytest.mark.asyncio
@@ -532,3 +533,68 @@ def test_execution_state_records_error_without_retaining_exception() -> None:
 
     assert state.primary_error_type == "RuntimeError"
     assert state.primary_error_message == "example failure"
+
+
+def test_execution_state_rejects_illegal_phase_transition() -> None:
+    state = LifespanExecutionState()
+
+    with pytest.raises(ValueError, match="Invalid lifespan phase"):
+        state.transition(LifespanPhase.RUNNING)
+
+
+@pytest.mark.asyncio
+async def test_published_state_is_immutable_snapshot(
+    app: FastAPI,
+    install_fake_integration: None,
+) -> None:
+    lifespan = create_integrated_bootstrap_health_lifespan()
+
+    async with lifespan(app):
+        snapshot = get_lifespan_execution_state(app)
+        assert snapshot is not None
+        assert isinstance(snapshot.phase_history, tuple)
+
+        with pytest.raises((AttributeError, TypeError)):
+            snapshot.phase = LifespanPhase.FAILED  # type: ignore[misc]
+
+        with pytest.raises((AttributeError, TypeError)):
+            snapshot.phase_history += ()  # type: ignore[misc]
+
+
+@pytest.mark.asyncio
+async def test_repeated_lifespan_execution_replaces_terminal_snapshot(
+    app: FastAPI,
+    install_fake_integration: None,
+) -> None:
+    lifespan = create_integrated_bootstrap_health_lifespan()
+
+    async with lifespan(app):
+        first_snapshot = get_lifespan_execution_state(app)
+
+    async with lifespan(app):
+        second_snapshot = get_lifespan_execution_state(app)
+
+    assert first_snapshot is not None
+    assert second_snapshot is not None
+    assert first_snapshot is not second_snapshot
+    assert first_snapshot.phase == LifespanPhase.RUNNING
+    assert second_snapshot.phase == LifespanPhase.RUNNING
+
+
+@pytest.mark.asyncio
+async def test_concurrent_lifespan_execution_is_rejected(
+    app: FastAPI,
+    install_fake_integration: None,
+) -> None:
+    lifespan = create_integrated_bootstrap_health_lifespan()
+    first_context = lifespan(app)
+    await first_context.__aenter__()
+
+    try:
+        with pytest.raises(
+            BootstrapHealthLifespanIntegrationError,
+            match="already executing",
+        ):
+            await lifespan(app).__aenter__()
+    finally:
+        await first_context.__aexit__(None, None, None)

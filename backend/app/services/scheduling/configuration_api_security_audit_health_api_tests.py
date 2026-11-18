@@ -393,7 +393,7 @@ def test_duplicate_route_registration_is_rejected(
 ) -> None:
     register_security_audit_health_routes(app)
 
-    with pytest.raises(RuntimeError, match="already registered"):
+    with pytest.raises(RuntimeError, match="already exists"):
         register_security_audit_health_routes(app)
 
 

@@ -9,6 +9,7 @@ import pytest
 
 from app.services.scheduling.configuration_api_security_audit_health import (
     AuditHealthCheckResult,
+    AuditHealthCheckStatus,
     AuditHealthReport,
     AuditHealthStatus,
 )
@@ -30,8 +31,10 @@ def healthy_report() -> AuditHealthReport:
         checks=(
             AuditHealthCheckResult(
                 name="logger_available",
-                passed=True,
+                status=AuditHealthCheckStatus.PASSED,
                 message="Audit logger is available",
+                checked_at=datetime.now(timezone.utc),
+                details={},
             ),
         ),
         logger_available=True,
@@ -46,8 +49,10 @@ def unhealthy_report() -> AuditHealthReport:
         checks=(
             AuditHealthCheckResult(
                 name="logger_available",
-                passed=False,
+                status=AuditHealthCheckStatus.FAILED,
                 message="Audit logger is unavailable",
+                checked_at=datetime.now(timezone.utc),
+                details={},
             ),
         ),
         logger_available=False,

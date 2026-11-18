@@ -209,7 +209,7 @@ class ConfigurationResponseSchema(BaseModel):
         cls,
         configuration: ScheduledTaskConfigurationSet,
     ) -> ConfigurationResponseSchema:
-        tasks = configuration.to_list()
+        tasks = configuration.configurations
 
         return cls(
             total_tasks=len(tasks),

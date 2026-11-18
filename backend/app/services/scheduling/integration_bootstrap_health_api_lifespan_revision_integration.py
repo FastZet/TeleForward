@@ -29,7 +29,7 @@ from app.services.scheduling.integration_bootstrap_health import (
     SchedulingBootstrapHealthService,
 )
 from app.services.scheduling.integration_bootstrap_health_api_integration import (
-    SchedulingBootstrapHealthAPIIntegration,
+    BootstrapHealthAPIIntegration,
     install_bootstrap_health_api_integration,
     is_bootstrap_health_api_integration_installed,
 )
@@ -88,12 +88,13 @@ class LifespanPhase(StrEnum):
     RUNNING = "running"
     CLEANING_UP = "cleaning_up"
     STOPPED = "stopped"
+    CANCELLED = "cancelled"
     FAILED = "failed"
 
 
 @dataclass(slots=True)
 class LifespanExecutionState:
-    """Observable state for one integrated lifespan execution."""
+    """Mutable state retained while one lifespan is executing."""
 
     phase: LifespanPhase = LifespanPhase.INITIALISING
     phase_history: list[tuple[LifespanPhase, datetime]] = field(
@@ -107,13 +108,51 @@ class LifespanExecutionState:
     cleanup_report: CleanupReport | None = None
 
     def __post_init__(self) -> None:
-        self.transition(self.phase)
+        self.phase_history.append(
+            (self.phase, datetime.now(timezone.utc))
+        )
 
     def transition(self, phase: LifespanPhase) -> None:
         """Record a lifecycle transition."""
 
         if not isinstance(phase, LifespanPhase):
             raise TypeError("phase must be a LifespanPhase")
+
+        allowed_transitions = {
+            LifespanPhase.INITIALISING: {
+                LifespanPhase.EXISTING_LIFESPAN_ENTERED,
+                LifespanPhase.INTEGRATION_INSTALLED,
+                LifespanPhase.FAILED,
+            },
+            LifespanPhase.EXISTING_LIFESPAN_ENTERED: {
+                LifespanPhase.INTEGRATION_INSTALLED,
+                LifespanPhase.FAILED,
+            },
+            LifespanPhase.INTEGRATION_INSTALLED: {
+                LifespanPhase.RUNNING,
+                LifespanPhase.FAILED,
+            },
+            LifespanPhase.RUNNING: {
+                LifespanPhase.CLEANING_UP,
+                LifespanPhase.FAILED,
+            },
+            LifespanPhase.FAILED: {
+                LifespanPhase.CLEANING_UP,
+            },
+            LifespanPhase.CLEANING_UP: {
+                LifespanPhase.STOPPED,
+                LifespanPhase.CANCELLED,
+                LifespanPhase.FAILED,
+            },
+            LifespanPhase.STOPPED: set(),
+            LifespanPhase.CANCELLED: set(),
+        }
+
+        if phase not in allowed_transitions[self.phase]:
+            raise ValueError(
+                f"Invalid lifespan phase transition: "
+                f"{self.phase.value} -> {phase.value}"
+            )
 
         self.phase = phase
         self.phase_history.append(
@@ -125,6 +164,34 @@ class LifespanExecutionState:
 
         self.primary_error_type = type(error).__name__
         self.primary_error_message = str(error)
+
+    def snapshot(self) -> LifespanExecutionStateSnapshot:
+        """Return an immutable copy safe to expose through app.state."""
+
+        return LifespanExecutionStateSnapshot(
+            phase=self.phase,
+            phase_history=tuple(self.phase_history),
+            existing_context_entered=self.existing_context_entered,
+            integration_installed=self.integration_installed,
+            exception_suppressed=self.exception_suppressed,
+            primary_error_type=self.primary_error_type,
+            primary_error_message=self.primary_error_message,
+            cleanup_report=self.cleanup_report,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class LifespanExecutionStateSnapshot:
+    """Immutable public snapshot of one lifespan execution."""
+
+    phase: LifespanPhase
+    phase_history: tuple[tuple[LifespanPhase, datetime], ...]
+    existing_context_entered: bool
+    integration_installed: bool
+    exception_suppressed: bool
+    primary_error_type: str | None
+    primary_error_message: str | None
+    cleanup_report: CleanupReport | None
 
 
 async def _invoke_callback(
@@ -169,7 +236,7 @@ async def _resolve_lifespan(
 async def _install_integration(
     app: FastAPI,
     service: SchedulingBootstrapHealthService | None,
-) -> SchedulingBootstrapHealthAPIIntegration:
+) -> BootstrapHealthAPIIntegration:
     """Install or reuse the bootstrap health API integration."""
 
     if is_bootstrap_health_api_integration_installed(app):
@@ -179,7 +246,7 @@ async def _install_integration(
 
         if not isinstance(
             integration,
-            SchedulingBootstrapHealthAPIIntegration,
+            BootstrapHealthAPIIntegration,
         ):
             raise BootstrapHealthLifespanIntegrationError(
                 "Registered bootstrap health integration has an invalid type"
@@ -227,11 +294,15 @@ def _publish_state(
 ) -> None:
     """Publish the current execution state on app.state."""
 
-    setattr(
-        app.state,
-        LIFESPAN_EXECUTION_STATE_KEY,
-        state,
-    )
+    try:
+        setattr(
+            app.state,
+            LIFESPAN_EXECUTION_STATE_KEY,
+            state.snapshot(),
+        )
+    except Exception:
+        # Diagnostics must not make application startup or shutdown fail.
+        logger.exception("Could not publish scheduler lifespan state")
 
 
 def _attach_cleanup_diagnostics(
@@ -330,6 +401,29 @@ def create_integrated_bootstrap_health_lifespan(
         if not isinstance(app, FastAPI):
             raise TypeError("app must be a FastAPI instance")
 
+        previous_state = getattr(
+            app.state,
+            LIFESPAN_EXECUTION_STATE_KEY,
+            None,
+        )
+
+        if (
+            isinstance(
+                previous_state,
+                LifespanExecutionStateSnapshot,
+            )
+            and previous_state.phase
+            not in {
+                LifespanPhase.STOPPED,
+                LifespanPhase.CANCELLED,
+                LifespanPhase.FAILED,
+            }
+        ):
+            raise BootstrapHealthLifespanIntegrationError(
+                "A scheduler health lifespan is already executing "
+                "for this application"
+            )
+
         state = LifespanExecutionState()
         _publish_state(app, state)
 
@@ -357,7 +451,7 @@ def create_integrated_bootstrap_health_lifespan(
 
             if not isinstance(
                 integration,
-                SchedulingBootstrapHealthAPIIntegration,
+                BootstrapHealthAPIIntegration,
             ):
                 raise BootstrapHealthLifespanIntegrationError(
                     "Health API installation returned an invalid integration"
@@ -432,7 +526,7 @@ def create_integrated_bootstrap_health_lifespan(
             if report is not None:
                 _attach_cleanup_diagnostics(primary_error, report)
 
-            state.transition(LifespanPhase.STOPPED)
+            state.transition(LifespanPhase.CANCELLED)
             _publish_state(app, state)
 
             raise primary_error.with_traceback(primary_traceback)
@@ -450,7 +544,7 @@ def create_integrated_bootstrap_health_lifespan(
         # If the existing lifespan suppressed the primary exception,
         # cleanup cancellation must still propagate.
         if report is not None and report.cancellation is not None:
-            state.transition(LifespanPhase.STOPPED)
+            state.transition(LifespanPhase.CANCELLED)
             _publish_state(app, state)
 
             raise CleanupCancelledError(report) from report.cancellation
@@ -471,7 +565,7 @@ def create_integrated_bootstrap_health_lifespan(
 
 def get_lifespan_execution_state(
     app: FastAPI,
-) -> LifespanExecutionState | None:
+) -> LifespanExecutionStateSnapshot | None:
     """Return the latest lifespan execution state, if available."""
 
     if not isinstance(app, FastAPI):
@@ -485,7 +579,7 @@ def get_lifespan_execution_state(
 
     if state is not None and not isinstance(
         state,
-        LifespanExecutionState,
+        LifespanExecutionStateSnapshot,
     ):
         raise BootstrapHealthLifespanIntegrationError(
             "Stored lifespan execution state has an invalid type"

@@ -11,6 +11,12 @@ from fastapi import FastAPI
 from app.services.scheduling.scheduler_lifecycle import (
     SchedulerLifecycleState,
 )
+from app.services.scheduling.base import (
+    BaseScheduledTask,
+    ScheduledTaskContext,
+    ScheduledTaskResult,
+    ScheduledTaskStatus,
+)
 from app.services.scheduling.scheduler_runtime import SchedulerRuntime
 from app.services.scheduling.scheduler_runtime_integration import (
     install_scheduler_runtime,
@@ -53,10 +59,25 @@ class FakeManager:
         self.shutdown_calls += 1
 
 
-class FakeTask:
+class FakeTask(BaseScheduledTask):
     """Minimal registered task for count tests."""
 
-    pass
+    def __init__(self, name: str) -> None:
+        self.name = name
+        super().__init__()
+
+    async def execute(
+        self,
+        context: ScheduledTaskContext,
+    ) -> ScheduledTaskResult:
+        return ScheduledTaskResult(
+            job_id=context.job_id,
+            execution_id=context.execution_id,
+            task_name=self.name,
+            status=ScheduledTaskStatus.COMPLETED,
+            started_at=context.started_at,
+            finished_at=context.started_at,
+        )
 
 
 @pytest.fixture
@@ -71,8 +92,8 @@ def manager() -> FakeManager:
 @pytest.fixture
 def registry() -> ScheduledTaskRegistry:
     task_registry = ScheduledTaskRegistry()
-    task_registry.register("task_one", FakeTask())
-    task_registry.register("task_two", FakeTask())
+    task_registry.register(FakeTask("task_one"))
+    task_registry.register(FakeTask("task_two"))
     return task_registry
 
 
