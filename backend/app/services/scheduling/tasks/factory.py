@@ -50,22 +50,22 @@ class ScheduledTaskFactory:
         self,
         cleanup_service: SchedulingCleanupService,
         *,
-        backup_operation: Callable[..., Awaitable[Mapping[str, Any]]],
+        backup_operation: Callable[..., Awaitable[Mapping[str, Any]]] | None,
         session_maintenance_operation: Callable[
             ..., Awaitable[Mapping[str, Any]]
-        ],
+        ] | None,
         telegram_sync_operation: Callable[
             ..., Awaitable[Mapping[str, Any]]
-        ],
+        ] | None,
         notification_dispatch_operation: Callable[
             ..., Awaitable[Mapping[str, Any]]
-        ],
+        ] | None,
         forwarding_operation: Callable[
             ..., Awaitable[Mapping[str, Any]]
-        ],
+        ] | None,
         backfill_operation: Callable[
             ..., Awaitable[Mapping[str, Any]]
-        ],
+        ] | None,
         health_checks: Mapping[
             str,
             Callable[[], Awaitable[Mapping[str, Any]]],
@@ -113,8 +113,8 @@ class ScheduledTaskFactory:
         }
 
         for name, operation in operations.items():
-            if not callable(operation):
-                raise TypeError(f"{name} must be callable")
+            if operation is not None and not callable(operation):
+                raise TypeError(f"{name} must be callable or None")
 
         if not self._health_checks:
             raise ValueError(
@@ -136,22 +136,43 @@ class ScheduledTaskFactory:
     def build(self) -> tuple[BaseScheduledTask, ...]:
         """Construct all configured scheduled task instances."""
 
-        tasks: tuple[BaseScheduledTask, ...] = (
+        configured_tasks: list[BaseScheduledTask] = [
             CleanupScheduledTask(self._cleanup_service),
             HealthCheckScheduledTask(self._health_checks),
-            BackupScheduledTask(self._backup_operation),
-            SessionMaintenanceScheduledTask(
-                self._session_maintenance_operation
-            ),
-            TelegramSyncScheduledTask(
-                self._telegram_sync_operation
-            ),
-            NotificationDispatchScheduledTask(
-                self._notification_dispatch_operation
-            ),
-            ForwardingScheduledTask(self._forwarding_operation),
-            BackfillScheduledTask(self._backfill_operation),
-        )
+        ]
+
+        if self._backup_operation is not None:
+            configured_tasks.append(
+                BackupScheduledTask(self._backup_operation)
+            )
+        if self._session_maintenance_operation is not None:
+            configured_tasks.append(
+                SessionMaintenanceScheduledTask(
+                    self._session_maintenance_operation
+                )
+            )
+        if self._telegram_sync_operation is not None:
+            configured_tasks.append(
+                TelegramSyncScheduledTask(
+                    self._telegram_sync_operation
+                )
+            )
+        if self._notification_dispatch_operation is not None:
+            configured_tasks.append(
+                NotificationDispatchScheduledTask(
+                    self._notification_dispatch_operation
+                )
+            )
+        if self._forwarding_operation is not None:
+            configured_tasks.append(
+                ForwardingScheduledTask(self._forwarding_operation)
+            )
+        if self._backfill_operation is not None:
+            configured_tasks.append(
+                BackfillScheduledTask(self._backfill_operation)
+            )
+
+        tasks = tuple(configured_tasks)
 
         if self._history_repository is None:
             return tasks
