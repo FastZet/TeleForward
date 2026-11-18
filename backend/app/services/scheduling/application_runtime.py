@@ -9,6 +9,9 @@ from sqlalchemy import text
 
 from app.core.config import get_settings
 from app.services.scheduling.cleanup import SchedulingCleanupService
+from app.services.scheduling.database_backup import (
+    build_sqlite_backup_operation,
+)
 from app.services.scheduling.history import ExecutionHistoryRepository
 from app.services.scheduling.manager import SchedulingManager
 from app.services.scheduling.scheduler import SchedulerService
@@ -46,6 +49,16 @@ def build_application_scheduler(app: FastAPI) -> SchedulerRuntime:
 
     settings = get_settings()
     history_repository = ExecutionHistoryRepository(session_factory)
+    storage_paths = getattr(app.state, "storage_paths", {})
+    backup_root = storage_paths.get("backups")
+    if backup_root is None:
+        raise RuntimeError(
+            "Backup storage must be initialised before scheduler setup"
+        )
+    backup_operation = build_sqlite_backup_operation(
+        settings.effective_database_url,
+        backup_root / "database",
+    )
     cleanup_service = SchedulingCleanupService(
         history_repository=history_repository
     )
@@ -59,7 +72,7 @@ def build_application_scheduler(app: FastAPI) -> SchedulerRuntime:
 
     task_factory = ScheduledTaskFactory(
         cleanup_service,
-        backup_operation=None,
+        backup_operation=backup_operation,
         session_maintenance_operation=None,
         telegram_sync_operation=None,
         notification_dispatch_operation=None,
